@@ -405,29 +405,81 @@ transaction is started.
 ### 6.1 Model (`app/models/`)
 
 Domain entities embed the **`*redifu.Record`** base (`github.com/21strive/redifu`), which carries identity and
-audit fields: `UUID`, `RandId`, `CreatedAt`, `UpdatedAt`, filled in the constructor through `redifu.InitRecord(...)`.
-Models carry `db:"…"` and `json:"…"` tags, use `null.*` for optional columns, and provide **setters** (a setter may
-validate and return a `*helper.ErrorLog`).
+audit fields: `UUID`, `RandId`, `CreatedAt`, `UpdatedAt`. Models carry `db:"…"` and `json:"…"` tags, use `null.*` for
+optional columns, provide **setters** (a setter may validate and return a `*helper.ErrorLog`), and have an
+**initiator** `New<Entity>()` that calls `redifu.InitRecord`.
 
 ```go
-type Availability struct {
-    *redifu.Record                          // UUID, RandId, CreatedAt, UpdatedAt
-    UserUUID  string      `json:"user_uuid" db:"user_uuid"`
-    Name      null.String `json:"name" db:"name"`
-    IsDefault null.Bool   `json:"is_default" db:"is_default"`
+type Booking struct {
+    *redifu.Record                     // UUID, RandId, CreatedAt, UpdatedAt
+    UserUUID string      `json:"user_uuid" db:"user_uuid"`
+    Status   string      `json:"status" db:"status"`
+    Note     null.String `json:"note" db:"note"`
 }
 
-func (m *Availability) SetName(name null.String) { m.Name = name }
+func (m *Booking) SetNote(note null.String) { m.Note = note }
 
-func NewAvailability() Availability {
-    a := &Availability{}
-    redifu.InitRecord(a) // fills UUID, RandId, CreatedAt, UpdatedAt
-    return *a
+func NewBooking() Booking {
+    booking := &Booking{}
+    redifu.InitRecord(booking) // allocates the Record, mints UUID + RandId, CreatedAt = UpdatedAt = now (UTC)
+    return *booking
 }
 ```
 
 `UUID` is the internal identity & relation key; `RandId` is a short random id that is safe to use in public
 URLs/cursors. Column conventions: [02-database.md](02-database.md).
+
+#### Initiator `New<Entity>()`: every entity has one, every new instance comes from it
+
+- **Every entity has an initiator `New<Entity>()`** in its model file (`booking_model.go` → `NewBooking()`), in the
+  shape above: allocate the struct, call `redifu.InitRecord` on it, return it. `InitRecord` allocates the embedded
+  `*redifu.Record`, mints `UUID` (v4) and `RandId` (16 characters from `crypto/rand`), and sets `CreatedAt` =
+  `UpdatedAt` = now (UTC). `InitRecord` is called **only** inside initiators, so the Go code mints identities in one
+  place.
+- **A new instance is created only through its initiator**, then filled field by field (setters or assignments):
+
+  ```go
+  booking := models.NewBooking()
+  booking.UserUUID = request.UserUUID.String // the caller, written by the validator
+  booking.Status = constants.BOOKING_STATUS_PENDING
+  booking.SetNote(request.Note)
+  if errorLog := u.bookingRepository.Insert(tx, &booking); errorLog != nil {
+      return rollbackAndReturn(errorLog)
+  }
+  ```
+
+- **Never write a new entity inline as a struct literal:**
+
+  ```go
+  // Record is nil: booking.UUID panics, redifu panics on its first method call, json.Marshal silently drops uuid/randid
+  booking := models.Booking{UserUUID: request.UserUUID.String, Status: constants.BOOKING_STATUS_PENDING}
+
+  // identity minted by hand: a second copy of InitRecord that drifts (here RandId and UpdatedAt are forgotten)
+  booking := models.Booking{Record: &redifu.Record{UUID: uuid.NewString(), CreatedAt: time.Now()}, UserUUID: …}
+
+  // InitRecord outside the initiator: identities are minted all over the codebase again
+  booking := &models.Booking{UserUUID: …, Status: …}
+  redifu.InitRecord(booking)
+  ```
+
+  One initiator per entity keeps every new identity correct by construction, and `grep 'models.NewBooking('` lists
+  every place a booking is born. Tests follow the same rule: `models.NewBooking()`, then set the fields the test pins.
+- **Never use the initiator for a row that already exists**: it already has its identity, and a freshly minted randid
+  orphans every index that points at it.
+  - Read from the database: sqlx allocates the embedded `Record` while it scans; a hand-written `rows.Scan` allocates
+    it without minting: `&models.Booking{Record: &redifu.Record{}}`.
+  - Updated: load the row (`ownedBookingForUpdate`), change it through setters, write it back.
+  - In the cache: a projection target starts empty (`&models.Booking{Record: &redifu.Record{}}`) so that the columns
+    the SQL query does not select stay zero, as sqlx leaves them; a key-only stub carries only its key
+    (`Record: &redifu.Record{UUID: key}`). See [04-caching.md](04-caching.md) §2.5 and §11.
+
+#### Everything the cache stores embeds `*redifu.Record`
+
+**Every object the cache stores embeds `*redifu.Record`**: the cache is redifu, and `*redifu.Record` is what satisfies
+`redifu.Blueprint`. Domain entities already embed it; so does a cached model whose table is keyed by a business key
+instead of `uuid`/`randid`, and so do the satellites, handles, and computed records the cache stores
+([04-caching.md](04-caching.md) §2.5). No object reaches redifu with a nil `Record`: redifu panics on its first method
+call.
 
 ### 6.2 Request & Response
 
@@ -639,6 +691,7 @@ if data.BookingID.Valid { use(data.BookingID.String) } // always check .Valid
 |---|---|---|
 | Interface | `<Name>Interface` | `BookingRepositoryInterface` |
 | Constructor | `New<Name>` | `NewBookingRepository`, `NewBookingUsecase` |
+| Entity initiator (calls `redifu.InitRecord`, §6.1) | `New<Entity>()` | `NewBooking()` |
 | Capability usecase | `<Domain><Capability>Usecase` | `BookingReschedulePreviewUsecase` |
 | Request DTO | `<Domain><Action>…` | `AvailabilityCreate` |
 | Response DTO | `<Domain><Action>Response` | `BookingCreateResponse` |
@@ -671,7 +724,8 @@ if data.BookingID.Valid { use(data.BookingID.String) } // always check .Valid
 For a new entity `Widget` (the full cross-repo checklist is in [11-checklists.md](11-checklists.md)):
 
 1. **Migration** — `migrations/NNN_widgets.sql` ([02-database.md](02-database.md)).
-2. **Model** — `app/models/widget_model.go` (embed `*redifu.Record`, `db`/`json` tags, setters, `NewWidget()`).
+2. **Model** — `app/models/widget_model.go` (embed `*redifu.Record`, `db`/`json` tags, setters, and the initiator
+   `NewWidget()` that calls `redifu.InitRecord`; every new widget is created through it, §6.1).
 3. **Repository** — `app/repositories/widget_repository.go` (interface + struct + `NewWidgetRepository`; reads through
    `dbRead`, writes take a `*sqlx.Tx`) → a field in `RepositoryProvider`. Cache (if needed) = a redifu decorator
    ([04-caching.md](04-caching.md) §"Adding a cache").

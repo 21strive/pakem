@@ -105,6 +105,9 @@ Short checklists. Every item points to the document that explains how and why.
 - [ ] Worktree + branch per repo; base = the plan's branch when the plan lives on a docs branch.
 - [ ] Migration (C), model, repository (+ cache when needed, D), DTOs, a usecase per capability (ownership!), validator,
       controller (Swagger with the full contract), route (feature switch, default off).
+- [ ] Every new model embeds `*redifu.Record` and has its initiator `New<Entity>()` (calls `redifu.InitRecord`); new
+      instances are created only through it, never as inline struct literals; everything the cache stores embeds
+      `*redifu.Record` ([01-architecture.md](01-architecture.md) §6.1).
 - [ ] Tests: usecase (another account is refused), validator (every spelling of identity keys), route, E2E per case (fails
       on master).
 - [ ] Full regression master vs branch; migrations on a dump copy.

@@ -62,6 +62,11 @@ project's `AGENTS.md` (created from [templates/project/AGENTS.md](templates/proj
   `WHERE`.
 - **The caller's identity is written after parsing**; identity fields carry `json:"-" query:"-" form:"-"`; key guards use
   `EqualFold` (JSON binding is case-insensitive, Unicode folding included).
+- **Every entity has an initiator `New<Entity>()`** that allocates it and calls `redifu.InitRecord` on it
+  (`booking := &Booking{}; redifu.InitRecord(booking); return *booking`), and **a new instance is created only through
+  it** (`booking := models.NewBooking()`, then set its fields), never as an inline struct literal. Rows that already
+  exist (read from the DB, cache projections and stubs) never go through it: a freshly minted randid orphans the cache
+  indexes ([docs/01-architecture.md](docs/01-architecture.md) §6.1).
 - **Errors are kinds**; 4xx messages are English sentinels (+ a stable `data.code`); 5xx are masked + `error_id`; driver
   text never reaches the client. A custom Fiber `ErrorHandler` (panic → envelope).
 - **Outbound side effects go through an outbox + worker**, never inside the request transaction; workers stay correct with
@@ -74,6 +79,9 @@ project's `AGENTS.md` (created from [templates/project/AGENTS.md](templates/proj
   transaction → per-owner drain. No Redis writes from requests, no purges when content changes.
 - **Each entity is stored once** (one key per uuid), indexes hold only uuids; reads go through a **decorator** that answers
   exactly like SQL and falls back to SQL on any failure; one queue check per owner per call.
+- **Everything the cache stores embeds `*redifu.Record`** (the cache is redifu; `*redifu.Record` satisfies
+  `redifu.Blueprint`): models through the model itself, satellites, handles, and computed records directly, never
+  through hand-written no-op `Blueprint` methods ([docs/04-caching.md](docs/04-caching.md) §2.5).
 - Caches are built only through the `redifucache` constructors (generation + lease); **no version in key names**; deploys
   and rollbacks need no manual step; emergency switch `REDIFU_READS=false`; clearing the cache = `command redifu-purge`,
   **never FLUSHALL**.

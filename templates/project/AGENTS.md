@@ -61,7 +61,10 @@ CGO_ENABLED=0 GOOS=linux go build -o ./<app> ./app/cmd
 - Controllers/middleware never call a repository. Only `app/responses` maps error kinds to HTTP.
 - Every resource from client input is checked in the usecase to belong to the caller; does not exist == not yours
   (the same 404).
-- Writes never touch Redis; the cache follows through trigger → `redifu_outbox` → drain.
+- Every entity has its initiator `New<Entity>()` (allocates it, calls `redifu.InitRecord`); a new instance is created
+  only through it, never as an inline struct literal; rows read from the DB are scanned, never `New…()`.
+- Writes never touch Redis; the cache follows through trigger → `redifu_outbox` → drain. Everything the cache stores
+  embeds `*redifu.Record`.
 - Outgoing side effects (email, WA, push, third-party APIs) go through an outbox table + worker, not inside the
   transaction.
 - Every new endpoint: Swagger (`make gen-swagger`) **and** the Postman collection in `app/specs/`.

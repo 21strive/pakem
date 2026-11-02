@@ -191,16 +191,37 @@ func (e *serviceEntity) MarshalRedis() ([]byte, error)    { return e.MarshalJSON
 func (e *serviceEntity) UnmarshalRedis(data []byte) error { return e.UnmarshalJSON(data) }
 ```
 
-- Satellites and handles do not embed `*redifu.Record`; they implement `redifu.Blueprint` with no-op methods, and
-  `GetRandId()` returns their key.
+- **MUST: every type the cache stores in a redifu `Base` embeds `*redifu.Record`**: the cache is redifu, and
+  `*redifu.Record` is what satisfies `redifu.Blueprint`. A row entity gets it through its model (`*models.Service`
+  above), and so does a model whose table is keyed by a business key instead of `uuid`/`randid` (its entity's
+  `GetRandId()` returns that key). Satellites, handles, and computed records embed it directly and override
+  `GetRandId()` to return their key; **MUST NOT** hand-write no-op `Blueprint` methods instead:
+
+  ```go
+  // satellite: the tags of one widget, keyed by the widget's uuid
+  type widgetTagsEntity struct {
+      *redifu.Record              // UUID = the widget's uuid = the key
+      Tags []*models.WidgetTag
+  }
+  func newWidgetTagsEntity(widgetUUID string) *widgetTagsEntity {
+      return &widgetTagsEntity{Record: &redifu.Record{UUID: widgetUUID}} // keyed by its parent: allocate, do not mint
+  }
+  func (e *widgetTagsEntity) GetRandId() string { return e.UUID }
+  ```
+
+  The `Record` is never nil when redifu sees the object: redifu panics on its first method call. redifu hands a
+  decoder a zero struct, so `UnmarshalRedis`/`UnmarshalJSON` **MUST** leave the `Record` allocated (`redifucache.Decode`
+  allocates a model's `Record` as it fills the columns; a satellite's own decoder sets `e.Record` itself).
 - **MUST** tag relation fields `json:"-"` (redifu rejects a relation without that tag: `ErrRelationNotTransient`).
   Without the tag, writing back a fetched item "bakes" a copy of the related entity into the parent's key — the
   singleton is broken for good.
 - **MUST** register relations on the `Base` (`base.AddRelation(...)`), not on an index, so that they apply to `Get`,
   `GetMany`, and every index, resolved per page with one round trip per level (at most 4). A relation whose key has
   expired yields `nil`; the decorator then loads it under the owner lock (`complete`) or falls back to SQL.
-- Domain models embed `*redifu.Record` (`uuid`, `randid`, `created_at`, `updated_at`); constructors call
-  `InitRecord`. **MUST NOT** call `InitRecord` for rows read from the DB (a new randid orphans the index).
+- Domain models embed `*redifu.Record` (`uuid`, `randid`, `created_at`, `updated_at`), and a new one is created only
+  through its initiator `New<Entity>()`, which calls `InitRecord` ([01-architecture.md](01-architecture.md) §6.1).
+  **MUST NOT** call `InitRecord` or an initiator for rows read from the DB, projection targets, or key-only stubs: a
+  new randid orphans the index, and a projection target starts empty (`&models.Widget{Record: &redifu.Record{}}`).
 
 ### 2.6 Codec: an entity is stored as its DB columns
 
@@ -1036,8 +1057,11 @@ Generic example: table `widgets` owned by `user_uuid`, junction `widget_tags`, v
        return out, nil
    }
    ```
-   A satellite (e.g. the tags per widget) = its own entity keyed by the widget uuid, generation
-   `store.BuildGeneration()`, `Relate`d from the widget through a `json:"-"` field.
+   `models.Widget` embeds `*redifu.Record` and has its initiator `NewWidget()`
+   ([01-architecture.md](01-architecture.md) §6.1); the loader scans existing rows, so it never calls `NewWidget()`.
+   A satellite (e.g. the tags per widget) = its own entity that embeds `*redifu.Record` with `UUID` = the widget uuid
+   (`widgetTagsEntity`, §2.5), generation `store.BuildGeneration()`, `Relate`d from the widget through a `json:"-"`
+   field.
 5. **Base + index + handler:**
    ```go
    func newRedifuWidgets(store *redifucache.Store) (*redifuWidgets, error) {

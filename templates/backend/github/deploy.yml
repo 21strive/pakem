@@ -1,0 +1,110 @@
+# Template — copy to .github/workflows/deploy.yml in the backend repo. Replace <project>, <region>.
+name: Build & Deploy to ECS
+
+# Manual only, on purpose. Deploying on every push to master makes master unusable
+# for anything else — it could not hold changes that are not ready, batch several
+# merges into one rollout, or take a late-night merge. Production moves when someone
+# decides it should: the Actions tab, or `gh workflow run deploy.yml --ref master`.
+on:
+  workflow_dispatch:
+
+# Least privilege: id-token for OIDC, contents for checkout.
+permissions:
+  id-token: write
+  contents: read
+
+# Two deploys never race on the same service.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: <region>
+  ECR_REPOSITORY: <project>-prod-app
+  ECS_CLUSTER: <project>-prod-cluster
+  ECS_SERVICES: "<project>-prod-api <project>-prod-worker"
+
+jobs:
+  deploy:
+    name: Build arm64 image, push to ECR, redeploy ECS
+    # Native arm64 runner: the ECS hosts are Graviton; a Go build under QEMU emulation takes 20–40 minutes.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: vars
+        run: |
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          # Single-platform manifest: attestations would push extra artifacts that the
+          # narrow ECR policy should not need to allow.
+          provenance: false
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.short_sha }}
+          # GIT_SHA and BUILD_TIME stamp the binary: the redifu cache generation and which build is newer.
+          build-args: |
+            TOKEN=${{ secrets.GOPRIVATE_TOKEN }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ steps.vars.outputs.build_time }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Terraform owns the task definition; this role deliberately lacks ecs:RegisterTaskDefinition.
+      # Both services point at :latest, so a forced new deployment is enough to roll out the new image.
+      - name: Force new deployment on both services
+        run: |
+          for service in $ECS_SERVICES; do
+            echo "::group::update-service $service"
+            aws ecs update-service \
+              --cluster "$ECS_CLUSTER" \
+              --service "$service" \
+              --force-new-deployment \
+              --no-cli-pager \
+              --query 'service.{service:serviceName,taskDefinition:taskDefinition}' \
+              --output table
+            echo "::endgroup::"
+          done
+
+      - name: Report rollout state
+        run: |
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services $ECS_SERVICES \
+            --no-cli-pager \
+            --query 'services[].{service:serviceName,desired:desiredCount,running:runningCount,rollout:deployments[0].rolloutState}' \
+            --output table
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed \`${{ steps.vars.outputs.short_sha }}\`"
+            echo ""
+            echo "- Image: \`${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.short_sha }}\` (also \`latest\`)"
+            echo "- Platform: \`linux/arm64\`"
+            echo "- Redeployed: \`${{ env.ECS_SERVICES }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,25 @@
+# Copy as .dockerignore. Keep the build context free of credentials and dead weight.
+
+# .git/config can hold a PAT in the remote URL; it must never end up in a layer.
+.git
+.gitignore
+
+# Local configuration. The image ships an empty .env; the real configuration comes from ECS.
+.env*
+.vscode
+.idea
+
+# Test-only, not needed by `go build ./app/cmd`.
+app/mocks
+**/*_test.go
+
+# Separate modules & documents — not part of the main binary.
+scripts
+docs
+.github
+
+# Local build artifacts
+<app>
+cmd
+coverage.txt
+.e2e

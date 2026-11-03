@@ -1,4 +1,9 @@
-# pakem
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/pakem-logo-white.svg">
+    <img src=".github/assets/pakem-logo-black.svg" alt="pakem" height="64">
+  </picture>
+</h1>
 
 > *Pakem* (Indonesian/Javanese): the canonical standard a wayang performance follows — here, the standard a backend
 > is built to.

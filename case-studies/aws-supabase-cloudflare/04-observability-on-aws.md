@@ -1,4 +1,4 @@
-# Case study 04 — Logs, error tracker, and dashboards on AWS
+# Case study 04 — Observability on AWS: CloudWatch Logs, DynamoDB, SES
 
 An illustration, not part of the standard: how the [case study](README.md) deployment met
 [06-observability.md](../../docs/06-observability.md) with CloudWatch Logs, DynamoDB, and SES — no observability agent

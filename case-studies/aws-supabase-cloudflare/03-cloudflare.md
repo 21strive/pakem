@@ -1,4 +1,4 @@
-# Case study 03 — Frontend, edge, files, and DNS on Cloudflare
+# Case study 03 — Cloudflare: frontend, edge, files, and DNS
 
 An illustration, not part of the standard: how the [case study](README.md) deployment met
 [09-frontend-and-storage.md](../../docs/09-frontend-and-storage.md) on Cloudflare. Its decision was that everything the

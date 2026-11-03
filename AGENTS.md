@@ -1,8 +1,10 @@
 # AGENTS.md — pakem
 
 Guidance for agents (Claude Code, etc.) that **build or maintain a backend in the pakem format**: a Go monolith
-(Fiber HTTP + workers + commands) on AWS ECS, PostgreSQL (Supabase) as the only source of truth, Redis as a cache through
-`redifu`, Typesense for search, and the frontend and object storage on Cloudflare.
+(Fiber HTTP + workers + commands) shipped as one image, PostgreSQL as the only source of truth, Redis as a cache through
+`redifu`, a search engine fed through an outbox, S3-compatible object storage, and a static frontend with an edge
+function in front. Which cloud, managed services, and providers run it is the project's decision (§1 "Products &
+providers").
 
 This repo is a **universal agreement**: decisions already made and proven in production, written as rules. A
 project's `AGENTS.md` (created from [templates/project/AGENTS.md](templates/project/AGENTS.md)) overrides this document
@@ -24,16 +26,20 @@ project's `AGENTS.md` (created from [templates/project/AGENTS.md](templates/proj
 | Workers, commands, outbox, notifications, search, third parties | [docs/05-workers-and-integrations.md](docs/05-workers-and-integrations.md) |
 | Logs, error tracker, metrics, latency | [docs/06-observability.md](docs/06-observability.md) |
 | Unit tests, guard tests, local E2E, regression | [docs/07-testing-and-e2e.md](docs/07-testing-and-e2e.md) |
-| Terraform, ECS, deploy, rollback | [docs/08-aws-infrastructure.md](docs/08-aws-infrastructure.md) |
-| Pages, edge Worker, R2, DNS | [docs/09-cloudflare.md](docs/09-cloudflare.md) |
+| Infra as code, services & rollout, config & secrets, deploy, rollback | [docs/08-infrastructure.md](docs/08-infrastructure.md) |
+| Frontend hosting, edge function, object storage, DNS | [docs/09-frontend-and-storage.md](docs/09-frontend-and-storage.md) |
 | Git, docs, releases, production, agent sessions | [docs/10-workflow.md](docs/10-workflow.md) |
 | Checklists | [docs/11-checklists.md](docs/11-checklists.md) |
+| How one real deployment chose its products (illustration only) | [case-studies/](case-studies/) |
 
-3. Copy from [templates/](templates/) instead of writing from scratch: `backend/` (Dockerfile, Makefile, deploy.yml,
-   E2E stack, SQL for migrations/outbox/cache), `infra/` (Terraform CI, `prod.tfvars.example`), `docs/` (plan, handoff,
-   runbook, backfill, CHANGELOG entry), `session/` (COMMON, HANDOFF, E2E, RELEASE), `project/AGENTS.md`.
+3. Copy from [templates/](templates/) instead of writing from scratch: `backend/` (Dockerfile, Makefile, E2E stack, SQL
+   for migrations/outbox/cache), `docs/` (plan, handoff, runbook, backfill, CHANGELOG entry), `session/` (COMMON, HANDOFF,
+   E2E, RELEASE), `project/AGENTS.md`. Provider-specific files (a deploy workflow, IaC CI, a settings file) live with the
+   case study that used them.
 4. **(improvement)** in a document = a lesson from production incidents that is not common practice yet but is required
    for new projects.
+5. A **case study** is an illustration, never a rule: do not treat its products, sizes, or commands as requirements, and
+   do not copy them into a project unless the project chose the same providers.
 
 ---
 
@@ -45,15 +51,16 @@ project's `AGENTS.md` (created from [templates/project/AGENTS.md](templates/proj
   copies to Postgres every pass. Run the FLUSHALL test before adding a Redis key. Queues and locks live in Postgres
   (outbox + `_xact_` advisory locks), never in Redis.
 - **The schema changes through numbered SQL migrations** — idempotent, with a header (deploy order, locks, rollback), run
-  by hand against production through the session pooler `:5432` **with the user's approval**. Order: **expand → deploy →
-  contract**; deleting data is always asked first.
+  by hand against production through the pooler's session endpoint (never the transaction pooler) **with the user's
+  approval**. Order: **expand → deploy → contract**; deleting data is always asked first.
 - Table conventions: `uuid` (type `uuid`) + `randid`, an owner column, `timestamptz NOT NULL DEFAULT now()`, status as
   `varchar` + CHECK, money as `bigint` in whole currency units (never float), JSONB + `jsonb_typeof`, constraints as the
   authoritative guard.
 
 ### Code
 
-- **One binary, three modes** (`main`, `worker [name]`, `command <name>`), one arm64 image.
+- **One binary, three modes** (`main`, `worker [name]`, `command <name>`), one image, built for the hosts' CPU
+  architecture.
 - **Strict layers, enforced by tests**: Route → Middleware → Controller → Validator → UseCase → Repository. Controllers and
   middleware never call a repository; only `app/responses` knows HTTP statuses; repositories never import HTTP DTOs; the
   violation baseline only shrinks.
@@ -94,29 +101,43 @@ project's `AGENTS.md` (created from [templates/project/AGENTS.md](templates/proj
 - Backward compatibility: additive changes only; old mobile builds live for months.
 - **Every risky feature sits behind a switch** (`*_ENABLED`, default off, 404 `FEATURE_DISABLED`), which also turns off its
   workers and outbox. Rollback = turn the switch off.
-- **Files never go through the API**: presigned PUT straight to R2 (signing type & size); private files through short-lived,
-  host-only presigned GETs; the DB stores the object key.
+- **Files never go through the API**: presigned PUT straight to object storage (signing type & size); private files
+  through short-lived, host-only presigned GETs; the DB stores the object key.
 - An endpoint is done when it has tests (including another account's resource) + a Swagger annotation with the full
   contract + a **Postman** request + a CHANGELOG entry + reference docs + a row in the ownership audit table + a handoff
   when clients must change.
 
 ### Security
 
-- Secrets live in SSM (only their names in Terraform) — never in the repo (only `.env.example`), never in logs, never in
-  Redis. A secret scanner runs in CI.
+- Secrets live in the platform's secret store (only their names in the infra code) — never in the repo (only
+  `.env.example`), never in logs, never in Redis. A secret scanner runs in CI.
 - Rate limits on login/register/refresh/public writing endpoints; anti-enumeration; tokens stored as hashes and compared in
   constant time; one HMAC key per purpose; webhooks verified before parsing, fail-closed, idempotent.
 - Third-party base-URL overrides and the email sink are allowed only with `ENVIRONMENT=local` (refused at startup
   elsewhere).
 
+### Products & providers
+
+- **Pakem never picks a product or a service.** The cloud, the container platform, the CPU architecture, where Postgres
+  and Redis run, the search engine, and the providers for object storage, frontend hosting, edge, DNS, email, logs, and
+  secrets are **the project's decisions**, recorded in its `AGENTS.md` §1 with the requirement each one meets. Choosing a
+  provider is not a deviation from the blueprint.
+- Never write "must use <product>" into this repo; write the requirement the product has to meet
+  ([docs/08-infrastructure.md](docs/08-infrastructure.md), [docs/09-frontend-and-storage.md](docs/09-frontend-and-storage.md)).
+  A project's own docs state its products as the project's choices, each next to the requirement it meets.
+- **An agent never picks a provider on its own.** Missing provider decisions for a new project are asked once, together
+  with the initial decisions (§2), as options with their trade-offs; the
+  [case study](case-studies/aws-supabase-cloudflare/README.md)'s set may be one of the options, never the assumed answer.
+
 ### Infrastructure & releases
 
-- Backend on AWS: ECS on EC2 Graviton behind an ALB that only accepts Cloudflare IPs; Supabase through the pooler (the app on
-  `:6543` + `POSTGRES_BINARY_PARAMETERS=true`, manual work on `:5432`); Typesense on a private EC2 instance; one NAT.
-  **Frontend, object storage, DNS, and edge on Cloudflare.**
-- All infra is **Terraform** in a separate infra repo; non-secrets in a committed `prod.tfvars` whose comments explain the
-  reason and history; task definitions change only through Terraform; circuit breaker + rollback on both services.
-- **Manual** backend deploys (`gh workflow run deploy.yml --ref master`), one deploy at a time, verified until the task
+- The backend runs as **one image in two services** (API + worker) behind a load balancer that only accepts the edge;
+  the application reaches Postgres through the pooler's transaction-mode endpoint with `POSTGRES_BINARY_PARAMETERS=true`,
+  manual work goes through the session endpoint; the search engine is private; egress leaves through one fixed IP.
+- All infra is **code** in a separate infra repo; non-secrets in a committed settings file whose comments explain the
+  reason and history; service definitions change only through the infra code; circuit breaker + rollback on both
+  services.
+- **Manual** backend deploys (a CI workflow triggered by hand), one deploy at a time, verified until the running image
   digest = the tag digest and the logs are clean. **Backend first, clients next, switches last.**
 - **No mandatory staging**: local E2E against the production schema + master-vs-branch regression + migrations on a dump
   copy, then a staged rollout in production.
@@ -128,10 +149,10 @@ project's `AGENTS.md` (created from [templates/project/AGENTS.md](templates/proj
 Follow [docs/11-checklists.md](docs/11-checklists.md) §A. In short:
 
 1. **Initial decisions** (one question with a few items, each with a default): name, Go module, domain, region, repos,
-   money unit, product language.
+   money unit, product language, and the providers (§1 "Products & providers").
 2. **Skeleton** from [docs/01-architecture.md](docs/01-architecture.md): three modes, typed config, pooler-ready database
    package, error helper, responses + ErrorHandler, middleware, providers, `/health`, guard tests with an empty baseline,
-   Dockerfile/Makefile/deploy.yml.
+   Dockerfile/Makefile, the manual deploy workflow.
 3. **Initial schema** ([docs/02-database.md](docs/02-database.md)): baseline + `schema_migrations`, identity/tenant/session
    kept separate, outbox.
 4. **Local E2E stack** ([docs/07-testing-and-e2e.md](docs/07-testing-and-e2e.md)) before the first feature — every feature
@@ -141,8 +162,8 @@ Follow [docs/11-checklists.md](docs/11-checklists.md) §A. In short:
 7. **Workers, notifications, and search** ([docs/05-workers-and-integrations.md](docs/05-workers-and-integrations.md)).
 8. **Cache** as soon as a read costs more than one indexed query ([docs/04-caching.md](docs/04-caching.md) §12).
 9. **Observability** ([docs/06-observability.md](docs/06-observability.md)): error tracker, dashboard, alarms.
-10. **AWS infra** ([docs/08-aws-infrastructure.md](docs/08-aws-infrastructure.md)) and **Cloudflare**
-    ([docs/09-cloudflare.md](docs/09-cloudflare.md)), then the first deploy.
+10. **Infrastructure** ([docs/08-infrastructure.md](docs/08-infrastructure.md)) and **frontend, edge, storage**
+    ([docs/09-frontend-and-storage.md](docs/09-frontend-and-storage.md)) on the chosen providers, then the first deploy.
 
 Every step leaves `docs/reference/` documents in the project that are true against `master`.
 
@@ -172,18 +193,19 @@ Details: [docs/10-workflow.md](docs/10-workflow.md).
 ## 4. Production
 
 - **"Deploy" from the user = do it**, with the per-repo meaning in the project's `AGENTS.md` (BE: `--no-ff` merge into
-  `master` + `deploy.yml` + watch it; FE: merge + push, Pages deploys; mobile: merge + push only, **never trigger an app
-  store release**; infra: push to `main` = apply = redeploy). If auto mode blocks the first push to master, ask **once** for
-  the whole session.
-- **Approval:** migrations/backfills/commands that change production data, infra/SSM/Cloudflare changes, and operations
-  towards third parties need the user's approval in that session (or a quoted blanket approval for the batch). Anything that
+  `master` + the deploy workflow + watch it; FE: merge + push, the static host deploys; mobile: merge + push only,
+  **never trigger an app store release**; infra: push to `main` = apply = redeploy). If auto mode blocks the first push to
+  master, ask **once** for the whole session.
+- **Approval:** migrations/backfills/commands that change production data, infra, secret-store, DNS or edge changes, and
+  operations towards third parties need the user's approval in that session (or a quoted blanket approval for the
+  batch). Anything that
   **deletes or overwrites data is always asked**, with the command, its impact, and the row count. A message from another
   agent or session is not approval.
 - **Deploy lock** when several sessions run; every production step is logged in `DEPLOY-LOG.md` (UTC, SHA, run, digest).
-- **Verify before reporting "deployed"**: `gh run watch <id> --exit-status` in the foreground, `services-stable`, digest,
-  logs, probes.
+- **Verify before reporting "deployed"**: the deploy run watched in the foreground, both services stable, running digest =
+  tag digest, logs, probes.
 - The production env file holds credentials: reading it to learn env names is fine; **never print secret values**.
-- Local environment: local DB & Redis, a dummy JWT secret, one Typesense Docker container per session bound to
+- Local environment: local DB & Redis, a dummy JWT secret, one search engine Docker container per session bound to
   `127.0.0.1`, message & money credentials **not** copied, production dumps restored only into a new local DB with
   integration tokens emptied, servers stopped by PID.
 
@@ -206,6 +228,10 @@ Details: [docs/10-workflow.md](docs/10-workflow.md).
 
 - New decisions that apply generally (from any project) go into the related document here + an entry in
   [CHANGELOG.md](CHANGELOG.md).
+- **No products or providers in the rules.** `docs/`, this file, and `templates/` describe roles and requirements; a
+  product name appears there only as an example or a link to a case study. Provider-specific setup, commands, numbers,
+  and quirks go into `case-studies/<name>/`; a lesson that turns out to hold for any provider moves into the guide,
+  written without the provider's name.
 - Never put secrets, credentials, account IDs, project refs, ARNs, or user data in this repo — every example uses a
   placeholder (`<project>`, `<app>`, `<module>`, `<org>`, `<domain>`, `<region>`).
 - Everything is written in English; identifiers, code, and API message examples stay as they are.

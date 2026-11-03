@@ -9,7 +9,7 @@
 --               does not read/write it (additive).
 -- Locks/rewrite: ADD COLUMN nullable = metadata-only, brief ACCESS EXCLUSIVE (lock_timeout 5s).
 -- Before applying: (no pre-check) | <query that finds the violating rows>
--- How to run: psql "<dsn session :5432>" -X -v ON_ERROR_STOP=1 -f migrations/NNN_<what>.sql
+-- How to run: psql "<dsn: session endpoint>" -X -v ON_ERROR_STOP=1 -f migrations/NNN_<what>.sql
 -- Rollback: ALTER TABLE widgets DROP COLUMN IF EXISTS archived_at;  (destructive — user approval; only before the code uses it)
 -- Backfill: none | backfills/<x>.sql after deploy
 -- Additive only. Idempotent: every statement can run twice.

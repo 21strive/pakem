@@ -20,9 +20,9 @@ The mode is selected by the first CLI argument:
 | Command | `go run ./app/cmd command <name> [arguments]` | One-off jobs (backfill, purge, retry), then exits |
 
 - All three share **the same connection bootstrap** (Postgres read, Postgres write, an extra pool when a library
-  needs its own pool, Redis, S3/R2 client) and **the same layered architecture**.
-- In production all three are **one Docker image**; the only difference is `command` in the ECS task definition
-  (`["main"]` for the API service, `["worker"]` for the worker service). See [08-aws-infrastructure.md](08-aws-infrastructure.md).
+  needs its own pool, Redis, the object storage client) and **the same layered architecture**.
+- In production all three are **one Docker image**; the only difference is the command in the service definition
+  (`["main"]` for the API service, `["worker"]` for the worker service). See [08-infrastructure.md](08-infrastructure.md).
 - Commands that need no connections (e.g. creating local tables for e2e) are registered in one function
   (`constants.CommandNeedsNoConnections`) and run before the connections are opened.
 - Commands **never** take the cache lease (see [04-caching.md](04-caching.md)): a one-off process only
@@ -87,11 +87,12 @@ All dependencies are assembled **once** at startup through **Providers** (§7) a
 | Test | `stretchr/testify`, `zhashkevych/go-sqlxmock`, `alicebob/miniredis/v2` |
 | Mock | `mockery` (v2), configured in `.mockery.yml` |
 | API docs | `swaggo/swag` (annotations → OpenAPI) **+ a mandatory Postman collection** in `app/specs/` |
-| Cloud | `aws-sdk-go-v2` (S3 client used for Cloudflare R2, SES, DynamoDB, CloudWatch Logs) |
-| Search | Typesense (self-hosted server) |
+| Object storage | an S3 API client (`aws-sdk-go-v2/service/s3` works with any S3-compatible store) |
+| Other providers | their SDKs or plain HTTP clients, as the project's providers require |
+| Search | a search engine with a Go client (the examples use Typesense) |
 
 Internal libraries (e.g. a payment ledger) are **separate Go modules** in private repos, tagged with semver, and pulled
-with `GOPRIVATE` + a token at build time (see the Dockerfile in [08-aws-infrastructure.md](08-aws-infrastructure.md)).
+with `GOPRIVATE` + a token at build time (see the Dockerfile in [08-infrastructure.md](08-infrastructure.md)).
 
 ---
 
@@ -109,9 +110,9 @@ with `GOPRIVATE` + a token at build time (see the Dockerfile in [08-aws-infrastr
 ├── scripts/                 # helper & e2e programs, each with its own go.mod
 │   └── e2e/                 # black-box HTTP tests against a running server (+ local/ stack, fakes)
 ├── Makefile                 # run / build / swagger / mock / e2e
-├── Dockerfile               # production image (static binary CGO_ENABLED=0, arm64)
+├── Dockerfile               # production image (static binary CGO_ENABLED=0, built for the hosts' architecture)
 ├── docker-compose.yaml      # optional, for running the image locally
-├── .github/workflows/deploy.yml
+├── .github/workflows/deploy.yml  # the manual deploy workflow (08 §6), on whatever CI the project uses
 ├── go.mod / go.sum
 ├── CHANGELOG.md
 └── .env.local / .env.staging  # non-production config examples (never contain production secrets)
@@ -123,7 +124,7 @@ Locally built binaries (`./cmd`, `./<app-name>`) are artifacts: add them to `.gi
 
 ```
 app/
-├── cmd/             # main.go (mode dispatch) + connection.go (DB/Redis/R2/AWS bootstrap)
+├── cmd/             # main.go (mode dispatch) + connection.go (DB/Redis/object storage/provider clients bootstrap)
 ├── buildinfo/       # Revision + Time, stamped through -ldflags when the image is built
 ├── handlers/        # assembles the runtime per mode: http_handler (Fiber), worker_handler, command_handler
 ├── routes/          # route.go — URL table; provider → controller → Fiber
@@ -144,7 +145,7 @@ app/
 ├── workers/         # background loops + init_worker.go (worker DI)
 ├── command/         # one-off commands + init_command.go (command DI)
 ├── notifications/   # example of a cross-domain subsystem (catalog, channels) — allowed, still obeys the import rules
-├── search/          # search index client & schema (Typesense)
+├── search/          # search engine client & schema
 ├── utils/           # stateless helpers + observability glue (logger handler, metrics)
 ├── mocks/           # mockery-generated mocks (do not edit by hand)
 ├── specs/           # generated OpenAPI + Postman collection (manual)
@@ -174,8 +175,8 @@ app/
    - Parse the arguments; no arguments → print a usage text with **a list of every worker and command, each with a
      one-line description** (this list is operational documentation; update it when you add a worker/command).
    - Log one build line: `revision`, `built_at`, `mode`.
-   - Open the shared connections **once**: Postgres read, Postgres write, library pool (if any), Redis, R2 client
-     (S3) + presign client. Connections are never opened per request.
+   - Open the shared connections **once**: Postgres read, Postgres write, library pool (if any), Redis, the object
+     storage client (S3 API) + presign client. Connections are never opened per request.
    - `switch` on the mode: `main` → `routes.NewHTTPRoute(...)` → `Listen`; `worker` → `workers.Init*Worker(...)`;
      `command` → `command.Init*Command(...)`.
 
@@ -184,13 +185,14 @@ app/
 - `fiber.Config` with `ReadTimeout`/`WriteTimeout` 30 s and `IdleTimeout` 120 s (env `HTTP_READ_TIMEOUT`,
   `HTTP_WRITE_TIMEOUT`, `HTTP_IDLE_TIMEOUT`). The fasthttp timeouts bound the **connection**, not the handler; a slow
   handler is bounded by the DB transaction limits and the library call limits (see [02-database.md](02-database.md)).
-  Request bodies are small (JSON); files **never** go through the API — clients upload directly to R2 with a presigned URL.
+  Request bodies are small (JSON); files **never** go through the API — clients upload directly to object storage with a
+  presigned URL.
 - Global middleware, in order: `TraceMiddleware` (a UUID per request in `Locals("trace_id")` + the
   `X-Trace-ID` header), `cors` (an **explicit** origin list, `AllowCredentials: true`, `ExposeHeaders` includes
   `X-Trace-ID`, `MaxAge` 86400), Fiber's `logger` (one line per request → input for latency analysis), `recover`
   with a stack trace.
 - The CORS origin list is pinned by a test (`TestMainHttpHandlerCORSOrigins`) so it cannot change silently.
-- `GET /health` for the ALB health check (declared without auth).
+- `GET /health` for the load balancer's health check (declared without auth).
 
 ---
 
@@ -209,9 +211,9 @@ One function, `NewHTTPRoute(...)`:
 4. Declares the URL table.
 
 ```go
-func NewHTTPRoute(ctx, cfg, dbRead, dbWrite, redis, r2Client, r2Presign, awsConfig) *fiber.App {
+func NewHTTPRoute(ctx, cfg, dbRead, dbWrite, redis, storageClient, storagePresign, providerClients) *fiber.App {
     repo := providers.NewRepositoryProvider(dbRead, dbWrite, redis)
-    uc   := providers.NewUseCaseProvider(ctx, cfg, repo, dbRead, r2Client, r2Presign, awsConfig)
+    uc   := providers.NewUseCaseProvider(ctx, cfg, repo, dbRead, storageClient, storagePresign, providerClients)
 
     bookingController := controllers.InitBookingController(repo, uc)
     // ... one per controller
@@ -526,22 +528,24 @@ Middleware follows the controller rules: data goes **through a usecase, never a 
 ### 6.5 Config (`app/config/`)
 
 `config.InitConfig()` loads `.env` (godotenv) into a typed `Configuration` struct (`App`, `HTTP`,
-`Database.Postgres.Read/Write/Transaction`, `Redis`, `R2`, one block per integration). Access it through `config.Get()`.
+`Database.Postgres.Read/Write/Transaction`, `Redis`, `Storage`, one block per integration). Access it through `config.Get()`.
 
-- **Precedence:** `godotenv.Load()` **does not override** env vars that already exist. On ECS all configuration arrives
-  as env vars; the image carries only an **empty** `.env` (godotenv fails if the file does not exist).
-- **A key that is present but empty still "exists":** setting `KEY=""` in the task definition overrides the `.env`
+- **Precedence:** `godotenv.Load()` **does not override** env vars that already exist. In production all configuration
+  arrives as env vars from the platform; the image carries only an **empty** `.env` (godotenv fails if the file does not
+  exist).
+- **A key that is present but empty still "exists":** setting `KEY=""` in the service definition overrides the `.env`
   value with an empty string. Keys that have no value yet are **commented out**, not emptied.
 - **Booleans are written exactly as `"true"`/`"false"`.** `strconv.ParseBool` rejects an unknown value (`"yes"`) and the
   config helper silently falls back to the default — no error reaches anyone. Document each switch's default in the code
-  and in the tfvars.
+  and in the committed infra settings.
 - Invalid configuration that makes the system dangerous (e.g. an unknown TLS mode) → **fail to start**; do not
   silently use a default. The process must also fail to start on: `JWT_API_SECRET` < 32 bytes outside `ENVIRONMENT=local`,
   and env vars that redirect third-party endpoints to stand-ins (`*_BASE_URL`, `*_ENDPOINT`, `EMAIL_SINK_DIR`) outside `local`.
 - Mistyped numeric/duration values (`0`, `ten`) fall back to the default **and are announced on stderr** (`config: … using …`).
 - **Renaming an env var without breaking a deploy:** the helper `getEnvStringDeprecated(key, deprecatedKey, default)` reads
-  the new name first, then the old name while printing a "rename it" warning at startup. Names follow the **provider**,
-  not the service (`CLOUDFLARE_ACCESS_KEY_ID`, not `R2_ACCESS_KEY_ID`).
+  the new name first, then the old name while printing a "rename it" warning at startup. A credential's name follows the
+  **provider account** that issues it, not one service of that provider (`<PROVIDER>_ACCESS_KEY_ID`, not
+  `<SERVICE>_ACCESS_KEY_ID`).
 - `getEnv` strips one pair of quotes around the value (env vars from an IDE are sent verbatim) and trims it (a newline
   from a secret mount breaks HMAC).
 
@@ -594,7 +598,7 @@ capabilities (auth, object storage), and third-party integration wrappers. The g
 (dependencies before their consumers). Large subsystems may have their own provider (`ledger_provider.go`, `queue_provider.go`).
 
 ```go
-func NewUseCaseProvider(ctx, cfg, repo *RepositoryProvider, dbRead, r2Client, r2Presign, awsConfig) *UseCaseProvider {
+func NewUseCaseProvider(ctx, cfg, repo *RepositoryProvider, dbRead, storageClient, storagePresign, providerClients) *UseCaseProvider {
     serviceUseCase      := usecases.NewServiceUsecase(repo.Service, repo.Availability, repo.General)
     availabilityUseCase := usecases.NewAvailabilityUsecase(repo.Availability, repo.Service, repo.General)
     userUseCase         := usecases.NewUserUseCase(ctx, repo.User, serviceUseCase, availabilityUseCase)

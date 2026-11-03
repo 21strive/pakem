@@ -11,7 +11,7 @@
 
 ## Rules for running one
 
-- One short psql connection through the session pooler :5432; `SET lock_timeout = '5s'`.
+- One short psql connection through the session endpoint (never the transaction pooler); `SET lock_timeout = '5s'`.
 - Back up first: `pg_dump -Fc … > ~/backup/<db>_<YYYYMMDD_HHMM>_preNNN.dump` (mode 600).
 
 ## <Instance>

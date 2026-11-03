@@ -27,9 +27,9 @@ Interpretation:
 
 ## Local resources (use only your own)
 
-| Session | BE port | Redis | Typesense | Gateway stand-in | DB prefix |
+| Session | BE port | Redis | Search engine | Gateway stand-in | DB prefix |
 |---|---|---|---|---|---|
-| `<slug>` | 81x1 | 64x1 | `typesense-<slug>` 127.0.0.1:81x1 | 81x1 | `<p>_<slug>_*` |
+| `<slug>` | 81x1 | 64x1 | `<search>-<slug>` 127.0.0.1:81x1 | 81x1 | `<p>_<slug>_*` |
 
 Do not touch: <shared port/DB/container>.
 

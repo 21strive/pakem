@@ -92,7 +92,7 @@ Applies to **every** use of Redis, not only redifu (user decision, 19 October 20
   cleaned up.
 - **MUST NOT** put a version segment in any key name (`…:v1:…`) — outside redifu too (§5.1).
 - **MUST NOT** store credentials in Redis: password hashes, login/refresh tokens, money-equivalent codes (buyers'
-  voucher codes). Incident: an old write-only cache copied `password_hash` and tokens to Redis Cloud. Guarded by an e2e
+  voucher codes). Incident: an old write-only cache copied `password_hash` and tokens to the hosted Redis. Guarded by an e2e
   test that scans every Redis value (§8.3).
 - Required Redis: **≥ 6.2** (`GETEX`), **single node** (the drain fence uses `WATCH` on one connection; Redis
   Cluster needs a different design). The design **must survive per-key eviction** (dangling detection, `ErrNotSeeded`,
@@ -634,7 +634,7 @@ current); a build that has just lost the lease can serve state for ≤ 250 ms (i
   (`time.NewTicker(0)` panics).
 - `DrainAll` runs only when `Ready` and this build holds the lease.
 - **MUST**: the engine uses only the `_xact_` advisory lock variants and `set_config(…, true)`/`SET LOCAL` inside
-  transactions — safe on the transaction pooler (`:6543`), where session state and session locks leak to other clients.
+  transactions — safe on a transaction-mode pooler, where session state and session locks leak to other clients.
 - The store uses the **primary** pool (dbWrite) for queue checks, seeds, and drains: a lagging replica would write stale
   data to Redis until the TTL runs out.
 
@@ -687,7 +687,7 @@ with the `Store`.
 ### 5.3 Build stamp
 
 `app/buildinfo/buildinfo.go`: `var Revision, Time string`, set through `-ldflags` from `GIT_SHA` and `BUILD_TIME`
-(Dockerfile + `deploy.yml`, see [08-aws-infrastructure.md](08-aws-infrastructure.md) §5).
+(Dockerfile + the deploy workflow, see [08-infrastructure.md](08-infrastructure.md) §5–§6).
 
 - Without `Revision`: build generation = binary fingerprint `"bin-<16 hex>"` + one WARN (two local builds do not share
   indexes).

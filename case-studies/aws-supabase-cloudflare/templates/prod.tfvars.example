@@ -7,6 +7,9 @@
 #   Secrets: local → terraform.tfvars (gitignored); CI → GitHub Secrets as TF_VAR_<name>;
 #   application → SSM Parameter Store (see app_secret_keys below).
 # Usage: terraform plan -var-file=prod.tfvars
+#
+# Case study "AWS + Supabase + Cloudflare" (pakem: case-studies/aws-supabase-cloudflare): an illustration, not part
+# of the pakem standard. Every value below is that deployment's choice.
 # ---------------------------------------------------------------------------
 
 # ---- Global ----

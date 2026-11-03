@@ -79,8 +79,8 @@ make e2e E2E_ARGS='-run TestWidget -timeout 90m'
   is **generated** in `$E2E_RUN_DIR` (never `.env.local/.env.staging`, which point at remote hosts): `ENVIRONMENT=local`,
   DB via socket + dummy password, `POSTGRES_SSLMODE=disable`, pools = production (10/10), dummy `JWT_API_SECRET`,
   `EMAIL_SINK_DIR`, `WHATSAPP_ENABLED=false`, `PUSH_ENABLED=false`; optional fakes per port; `env.extra` appended at the
-  end (local Typesense, gateway stand-in); server + notification worker + `E2E_EXTRA_WORKERS` run in the background with
-  pid files; wait for `/health`.
+  end (local search engine, gateway stand-in); server + notification worker + `E2E_EXTRA_WORKERS` run in the background
+  with pid files; wait for `/health`.
 - **`down.sh`:** stop **by PID** (never by pattern).
 - Per-session overrides: `E2E_PORT`, `E2E_REDIS_PORT`, `E2E_DB`, `E2E_RUN_DIR` (default `<worktree>/.e2e`).
 - **MUST** the harness env = the relevant production env, including **feature switch values** (without
@@ -101,8 +101,8 @@ feature yet" hides this problem). Example: the group-session suite fails on mast
 ## 6. Full-suite regression: master vs branch
 
 1. Build a binary from `origin/master` and one from the branch.
-2. For **each**: drop & rebuild the DB, flush Redis, delete the Typesense collections, keep env & workers exactly the same
-   (including production flags).
+2. For **each**: drop & rebuild the DB, flush Redis, delete the search engine's collections, keep env & workers exactly
+   the same (including production flags).
 3. Seed the suite owner, run the full suite, save the sorted `--- FAIL` lines.
 4. **Compare the sets:** branch-only FAILs must be 0; master-only FAILs = the new tests; for FAILs common to both sides,
    also compare at assertion level (file:line + message, IDs & numbers normalized).
@@ -136,8 +136,8 @@ Example report: "100 in 0.05 s, 101 in 0.04 s; both re-run cleanly (idempotent);
 ## 8. Client tests
 
 - **Web & dashboard:** `npx vitest run` (`--maxWorkers=2`); eslint + prettier on the changed files; `vite build` (asset
-  hashes match Pages → can be compared with the live bundle); **Playwright** for the main flows against the local branch
-  BE.
+  hashes match the static host's build → can be compared with the live bundle); **Playwright** for the main flows against
+  the local branch BE.
   - The local BE's CORS allows only `http://localhost:5173`: run Vite with `--host localhost --port 5173 --strictPort`
     while holding the **port lock** (one user per machine); **MUST NOT** commit CORS changes made for e2e.
   - API calls from Node go to `127.0.0.1`, the browser uses `localhost` (Fiber is IPv4 only).

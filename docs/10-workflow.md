@@ -2,8 +2,8 @@
 
 How agents and humans work: from the brief to a feature live in production, plus the rules for the local
 environment, production approvals, and orchestrating many agent sessions. Testing is detailed in
-[07-testing-and-e2e.md](07-testing-and-e2e.md); the deploy infrastructure in [08-aws-infrastructure.md](08-aws-infrastructure.md)
-and [09-cloudflare.md](09-cloudflare.md).
+[07-testing-and-e2e.md](07-testing-and-e2e.md); the deploy infrastructure in [08-infrastructure.md](08-infrastructure.md)
+and [09-frontend-and-storage.md](09-frontend-and-storage.md).
 
 Markers: **MUST** (hard rule; has caused real problems or was requested by the user), **MUST NOT**, **SHOULD**
 (default; deviating is allowed with a written reason). Section §10 contains **recommended improvements** for new projects
@@ -105,7 +105,7 @@ All of the following must hold:
 
 - Default: commit on the work branch; **push / open a PR only when the user asks**. Batch rules (COMMON.md) may grant
   permission to "push the work branch any time as a backup" — except the main branch, and except the infra repo (a PR
-  there triggers the CI `terraform plan`).
+  there triggers the CI plan).
 - **MUST open one PR per feature per repo, not stacked PRs**, even if the plan says PR1/PR2/PR3 (user: "disatuin aja,
   jangan dipisah2" ("just put it all together, don't split it up")). Commits may still be split per part; test the final
   tip once; note it in the plan status.
@@ -312,14 +312,14 @@ schema change stays in its migration. Details: [02-database.md](02-database.md).
 
 ### 6.1 No staging
 
-Local validation against real components (local Supavisor/PgBouncer for pooler mode, a dump copy for migrations), then
+Local validation against real components (a local pooler of the same kind as production, a dump copy for migrations), then
 a staged rollout in production with fast rollback (e.g. one phase per change, ±30 minutes of monitoring per phase).
 Plan steps that mention "staging" are replaced, and the replacement is written in the plan.
 
 ### 6.2 Approval model
 
 - **Needs the user's explicit approval in that session:** migrations, backfills, or any command that changes the
-  production DB/Redis; infra/SSM/Cloudflare changes; deploys; submitting templates to a messaging provider; operations
+  production DB/Redis; infra, secret store, DNS or edge changes; deploys; submitting templates to a messaging provider; operations
   towards third parties (email, push, payments).
 - **Blanket approval per batch** may be given by the user and is **quoted** in COMMON.md (e.g. "deploy tanpa
   bertanya" ("deploy without asking"), "migrasi yang tidak menghapus data boleh" ("non-destructive migrations are
@@ -343,9 +343,9 @@ Plan steps that mention "staging" are replaced, and the replacement is written i
 - **Check the schema first** (`\d table`, the objects that mark a migration) — without a migration history
   table this is the only way to know (see §10).
 - **One short psql connection**, closed right away; manual work (psql, migrations, `pg_dump`, `CONCURRENTLY`) goes
-  through the **session pooler :5432**, not the transaction pooler :6543 (a session `SET` leaks into application
-  connections). The session pooler has a limited number of slots, shared with the application; when it is full
-  (`EMAXCONNSESSION`) → retry ±40 s later.
+  through the **session endpoint**, not the transaction pooler (a session `SET` leaks into application connections).
+  A session pooler has a limited number of slots, shared with whatever else uses it; when it is full (e.g.
+  `EMAXCONNSESSION`) → retry ±40 s later.
 - `psql -X -v ON_ERROR_STOP=1 -f <file>`; `SET lock_timeout = '5s'` for ALTERs on busy tables; `CONCURRENTLY` outside
   a transaction (no `-1`), finished with an `indisvalid` check.
 - **Backup before a migration:** `pg_dump -Fc` to `~/backup/<db>_<YYYYMMDD_HHMM>_preNNN.dump` (mode 600, `pg_dump`
@@ -385,27 +385,28 @@ MUST NOT hold the lock during a long regression. MUST NOT delete another session
 after its holder has been checked). Log format (append-only, UTC):
 
 ```md
-- 2026-10-16T02:24:43Z `deploy` ACQUIRED by **<slug>**: BE master + deploy.yml (no migration) → web main → mobile develop
+- 2026-10-16T02:24:43Z `deploy` ACQUIRED by **<slug>**: BE master + deploy workflow (no migration) → web main → mobile develop
 - …T02:25:51Z [<slug>] BE master <a>..<b> `Merge branch 'feat/x'` (tree = tested branch <sha>; no migration)
-- …T02:34:34Z [<slug>] deploy.yml run <id> success; api + worker COMPLETED, running digest = ECR tag <sha7>; logs clean; probe <route> → <status>
-- …T02:37:20Z [<slug>] web: "Cloudflare Pages: <project>" success on <sha>; live bundle carries <chunk>
+- …T02:34:34Z [<slug>] deploy run <id> success; api + worker stable, running digest = registry tag <sha7>; logs clean; probe <route> → <status>
+- …T02:37:20Z [<slug>] web: the host's deploy check success on <sha>; live bundle carries <chunk>
 - …T02:38:17Z `deploy` RELEASED by **<slug>**: <SHA per repo, run, digest, migrations>
 ```
 
 ### 6.6 Deploy & verification
 
-- BE: [08-aws-infrastructure.md](08-aws-infrastructure.md) §6 (compare the last deployed SHA vs master; `gh run watch
-  --exit-status` in the foreground; `services-stable`; task digest = tag digest; 10–15 minutes of logs compared against
-  the list of known noise; `/health`; probe new routes without a token; smoke tests only on your own test accounts).
-- Failed rollout: ECS rolls back by itself (circuit breaker); investigate, fix forward under the same lock. Scaling a
+- BE: [08-infrastructure.md](08-infrastructure.md) §6 (compare the last deployed SHA vs master; watch the deploy run in
+  the foreground; both services stable; running digest = tag digest; 10–15 minutes of logs compared against the list of
+  known noise; `/health`; probe new routes without a token; smoke tests only on your own test accounts).
+- Failed rollout: the platform rolls back by itself (circuit breaker); investigate, fix forward under the same lock. Scaling a
   service or changing the DB pool = ask the user. MUST NOT roll back past a release that carried a destructive
   migration.
-- Web/dashboard/edge: [09-cloudflare.md](09-cloudflare.md) §2–§3.
+- Web/dashboard/edge: [09-frontend-and-storage.md](09-frontend-and-storage.md) §2–§3.
 - **Mobile: NEVER trigger an app store release.** A mobile deploy ends with the push to its main branch; do not run any
   workflow in the mobile repo (`gh workflow run`, `gh run rerun`, API, web) and do not run `fastlane`. Before pushing,
   make sure no workflow is triggered by that push (if one is: do not push, ask the user); after the push, `gh run list`
   is unchanged.
-- Infra: apply = redeploy → inside the lock, logged; fill SSM before pushing; the local plan contains only your changes.
+- Infra: apply = redeploy → inside the lock, logged; fill the secret store before pushing; the local plan contains only
+  your changes.
 - One-off commands in production: a one-off task with the same image, `--dry-run` first. **MUST NOT run `FLUSHALL`**;
   use `command redifu-purge` ([04-caching.md](04-caching.md)).
 
@@ -425,7 +426,7 @@ after its holder has been checked). Log format (append-only, UTC):
 
 ### 7.1 Per-session resources
 
-When several sessions share one machine, allocate up front and use only your own: BE port, Redis port, Typesense
+When several sessions share one machine, allocate up front and use only your own: BE port, Redis port, search engine
 container + port, gateway stand-in port, local DB prefix, **migration number range**, sub-agent ports, Vite/static
 ports. Also list the ports that must not be touched. Check `ss -ltn` before using a port.
 
@@ -435,11 +436,13 @@ ports. Also list the ports that must not be touched. Check `ss -ltn` before usin
 |---|---|
 | Postgres & Redis | always local (`redis-server --port <p> --bind 127.0.0.1 --save '' --daemonize yes`) |
 | `JWT_API_SECRET` | dummy, not the production value |
-| Typesense | one Docker container per session, dummy API key, **bind `127.0.0.1`** (a Docker port on `0.0.0.0` is open to the outside) |
-| R2, Google, Zoom | production credentials only for entities/accounts created by tests; fakes are better (`fakes3`, `fakegoogle`, `fakezoom`) |
-| Payment gateway, WhatsApp, email (SES), push | **do not copy** into the local env; use stand-ins and file sinks |
+| Search engine | one Docker container per session, dummy API key, **bind `127.0.0.1`** (a Docker port on `0.0.0.0` is open to the outside) |
+| Object storage, Google, Zoom | production credentials only for entities/accounts created by tests; fakes are better (`fakes3`, `fakegoogle`, `fakezoom`) |
+| Payment gateway, WhatsApp, email, push | **do not copy** into the local env; use stand-ins and file sinks |
 | Production dump copy | contains PII & tokens: empty the integration/device/session tokens before starting the server; do not start message/payment-sending workers; do not modify/delete real entities that have files in production storage; do not commit/share |
 | Production env file | may be read to learn env names; **never print secrets** |
+
+For example, with Typesense:
 
 ```bash
 docker run -d --name typesense-<slug> --restart unless-stopped \
@@ -477,9 +480,9 @@ docker run -d --name typesense-<slug> --restart unless-stopped \
 - Check `df -h /` before a long regression or a release. `~/.cache/go-build` can grow to tens of GB: trim it with
   `find ~/.cache/go-build -type f -mmin +240 -delete` (`+20` in an emergency), then recreate the 256 shard directories.
 - `node_modules` in a new worktree: hardlink (`cp -al`) from a worktree with the same lockfile.
-- Local toolchain versions = CI (Go, Node, Flutter `.fvmrc`, Terraform `TF_VERSION`); local Postgres version =
+- Local toolchain versions = CI (Go, Node, Flutter `.fvmrc`, the IaC tool's pinned version); local Postgres version =
   production. Do not install toolchains into `/tmp`.
-- End of session: stop (do not delete) the Typesense container; stop stand-ins/fakes/servers; drop unused local DBs;
+- End of session: stop (do not delete) the search engine container; stop stand-ins/fakes/servers; drop unused local DBs;
   remove comparison worktrees; record what was kept/deleted.
 
 ---

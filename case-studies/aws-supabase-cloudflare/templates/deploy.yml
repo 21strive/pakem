@@ -1,4 +1,8 @@
 # Template — copy to .github/workflows/deploy.yml in the backend repo. Replace <project>, <region>.
+# The backend's manual deploy: a native arm64 image pushed to ECR, then a forced new deployment of both ECS services.
+#
+# Case study "AWS + Supabase + Cloudflare" (pakem: case-studies/aws-supabase-cloudflare): an illustration, not part
+# of the pakem standard. Use it only if your backend also runs on ECS with its images in ECR.
 name: Build & Deploy to ECS
 
 # Manual only, on purpose. Deploying on every push to master makes master unusable

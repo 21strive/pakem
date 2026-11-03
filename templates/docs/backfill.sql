@@ -5,7 +5,7 @@
 -- Why:   <reason>
 -- Queue: <the worker that drains the outbox filled here, e.g. search-indexer>
 -- Idempotent: safe to re-run (NOT EXISTS / ON CONFLICT DO NOTHING).
--- Run: psql -X -v ON_ERROR_STOP=1 -f backfills/<what>.sql   (session pooler :5432)
+-- Run: psql -X -v ON_ERROR_STOP=1 -f backfills/<what>.sql   (the session endpoint, never the transaction pooler)
 
 INSERT INTO search_index_outbox (entity_type, entity_uuid, operation, status)
 SELECT 'widget', w.uuid, 'UPSERT', 'PENDING'

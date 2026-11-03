@@ -3,7 +3,11 @@
 Every effect outside the system (email, WhatsApp, push, search index, image rendering, statistics projections, cache
 invalidation) is carried out by **workers** that drain **outbox tables in Postgres**, written in the same business
 transaction. There is no message broker. This document standardizes the shape of workers & commands, the outbox pattern,
-the multi-channel notification system, Typesense search, and third-party integrations.
+the multi-channel notification system, search, and third-party integrations.
+
+The channels and providers named here (an email API, WhatsApp, push, a search engine, OAuth providers, a payment gateway)
+are the ones these lessons were learned with. Which channels and providers a product uses is the project's decision; the
+rules — timeouts, error classification, kill switches, idempotency, local fakes — apply to any of them.
 
 Markers: **MUST / MUST NOT / SHOULD**. **(improvement)** = a lesson from production incidents that is not common practice yet; required for new projects.
 
@@ -16,7 +20,7 @@ Markers: **MUST / MUST NOT / SHOULD**. **(improvement)** = a lesson from product
 - One entrypoint: `go run ./app/cmd main | worker [name] | command <name> [args]`. `worker` without a name starts **all**
   workers in one process (each in its own goroutine); `worker <name>` starts just that one; `command` runs to completion.
   Worker/command names = centralized string constants (`WorkerNotification = "notification"`).
-- In production: one ECS worker service runs `worker` (desired 1).
+- In production: one worker service runs `worker` (one instance, [08-infrastructure.md](08-infrastructure.md) §4.2).
 - `Init*Worker` (`app/workers/init_worker.go`) = per-worker DI; `Start*Worker` = its loop. Signal wrapper:
   ```go
   func runWithSignal(ctx context.Context, name string, startFn func(context.Context)) {
@@ -31,8 +35,8 @@ Markers: **MUST / MUST NOT / SHOULD**. **(improvement)** = a lesson from product
 - **MUST**, for a feature worker whose switch is off: do not wire it in "all" mode; in named mode, `return` immediately
   with an Info log (an idle process that looks like a running worker is misleading). A worker that still has cleanup work
   while the feature is off stays wired.
-- **MUST** run commands that do not touch DB/Redis/R2 (rendering templates, provider operations, local table setup)
-  **before** connections are opened (`CommandNeedsNoConnections(name)`); they receive `nil` for every handle.
+- **MUST** run commands that do not touch DB/Redis/object storage (rendering templates, provider operations, local table
+  setup) **before** connections are opened (`CommandNeedsNoConnections(name)`); they receive `nil` for every handle.
 - The first log line of every process: `<app>: build revision=<sha> built_at=<t> mode=<m>`.
 - **(improvement)** one **registry** `name → {help, needsConnections, run}` that also generates the help (a list
   printed in several places, or a worker count in an infra comment, goes stale).
@@ -74,11 +78,12 @@ go func() {
   (drift) — name the zone and `import _ "time/tzdata"` (the runtime image has no tzdata); failing to load the zone = the
   worker does not start (never silently fall back to UTC).
 - **MUST** put periodic retention/cleanup in a **worker loop** (daily timer, first run ±5 minutes after boot) or in a
-  **Terraform-managed scheduled task**. **MUST NOT** just write "daily cron" in the help — a command that is only
+  **scheduled task managed by the infrastructure code**. **MUST NOT** just write "daily cron" in the help — a command that
+  is only
   documented as "daily" never runs.
 - **MUST** give every per-item I/O its own time limit (`http.Client{Timeout}` / `context.WithTimeout`): object storage
-  30 s (deletes inside a request 10 s), WhatsApp 20 s, push 15 s, OAuth 15 s, Maps 8 s, payment library 40 s. The S3/R2
-  client has no HTTP timeout of its own and the SDK retries — one slow object can hold up a tick.
+  30 s (deletes inside a request 10 s), WhatsApp 20 s, push 15 s, OAuth 15 s, Maps 8 s, payment library 40 s. The object
+  storage client has no HTTP timeout of its own and the SDK retries — one slow object can hold up a tick.
 - Multi-step workers: each failed step is logged and the next step still runs; check `ctx.Done()` between steps.
 - **Workers that guard a business invariant** still emit an ERROR when the invariant is violated, even though the loop is
   healthy (e.g. "money awaiting settlement exceeds the age limit") — that ERROR line is what the error tracker catches.
@@ -90,9 +95,9 @@ go func() {
   enabled, a duplicate sender in the registry, the catalog names a channel that has no sender. Reason: "enabled but
   unconfigured" produces one credential error per message, which reads like a provider outage and burns the retry budget.
 - **Know the cost in the combined process:** `worker` without a name = one process → one worker's `os.Exit(1)` kills
-  **all** workers (email, settlement) and ECS crash-loops. That is why the release order is recorded in tfvars: deploy the
-  image that carries the catalog change **first**, then apply the env that turns the channel on; fill SSM **first**,
-  before the task definition references it.
+  **all** workers (email, settlement) and the worker service crash-loops. That is why the release order is recorded next
+  to the switch in the committed infra settings: deploy the image that carries the catalog change **first**, then apply
+  the env that turns the channel on; fill the secret store **first**, before the service definition references it.
 - **Degrade loud** for integrations that may be absent: no payment library → the settlement worker logs `slog.Error` and
   does not start; error tracker without its table → Warn, then return.
 - **(improvement)** a `worker --check` that builds every `Init*` without starting them, run in CI — catalog/template
@@ -102,10 +107,10 @@ go func() {
 
 - If SIGTERM cancels the context and the process exits **without waiting** for the running tick, this is safe
   **only because** every queue uses claim + reaper + idempotency (§2). **(improvement)** a `sync.WaitGroup` per worker +
-  wait for the tick to finish, with a limit below the ECS `stopTimeout` (default 30 s).
+  wait for the tick to finish, with a limit below the platform's stop timeout (often 30 s).
 - **Correctness does not depend on a singleton.** There is no leader election: workers are correct even when running
   as > 1 instance (`SKIP LOCKED` claims, compare-and-set updates, conditional writes, deterministic references to the
-  gateway). Being a singleton is only an ECS deploy concern (desired 1, min 0% / max 100%, circuit breaker).
+  gateway). Being a singleton is only a deploy setting (one instance, min 0% / max 100%, circuit breaker).
 - **Per-key** exclusivity uses a transaction-level lock: `SELECT pg_try_advisory_xact_lock(hashtextextended('<ns>:' ||
   $1, 0))` in a short transaction; failure = skip that key, the next pass retries it. **MUST NOT** use session-level
   locks/`SET` behind a transaction pooler.
@@ -126,7 +131,7 @@ go func() {
 ### 1.5 Logging in workers
 
 - Message `"<worker>_worker: <event>"` + kv fields; the "started" log carries the interval/batch.
-- **MUST** write **no log** on a tick without work (CloudWatch cost + noise).
+- **MUST** write **no log** on a tick without work (log storage cost + noise).
 - **MUST** log the observer's own failures (e.g. the error tracker failing to read logs) as WARN, not ERROR (so they do
   not become a new error group every minute).
 - Money amounts in logs are in human units (`4000.16`, not `400016` cents).
@@ -148,7 +153,7 @@ go func() {
   refusal).
 - **MUST** clearly label commands with third-party effects in the help (sends paid messages; registers templates that
   cannot be undone).
-- Running in production: as a one-off ECS task with the same image, or from an operator machine with inline env (`.env`
+- Running in production: as a one-off task with the same image, or from an operator machine with inline env (`.env`
   must exist; inline env wins). Commands use up the pooler's connection quota → small pool
   ([02-database.md](02-database.md) §6.4).
 - **MUST** remove secrets that travel in notifications (reset links, verification codes) from the outbox payload once
@@ -173,7 +178,7 @@ go func() {
       // recipient required; payload marshaled; available_at defaults to now(); INSERT in the caller's tx
   }
   ```
-- **MUST NOT** call providers (email/WA/push/Typesense/render) on the request path for effects that can be deferred — the
+- **MUST NOT** call providers (email/WA/push/search/render) on the request path for effects that can be deferred — the
   request only writes the intent. Deliberate exceptions: presigned URLs (no effect), and calls whose result the response
   needs (the payment gateway at checkout, with a timeout, outside the transaction).
 - **MUST** read queues from the **primary** ("worker must see a row as soon as the transaction that wrote it commits").
@@ -270,8 +275,9 @@ reaped delivery may already have reached the provider). **MUST** give every queu
   ```
 - Outbox status `DISPATCHED` is **terminal** (later failures live on the delivery). Each delivery is finalized with its
   own write — **MUST NOT** use one transaction for several channels.
-- Layer 3 differs per provider (SES has no idempotency token → tag `delivery_uuid` for bounce correlation; FCM uses the
-  delivery uuid as the collapse key; the inbox uses `UNIQUE (notification_uuid, recipient)`).
+- Layer 3 differs per provider (an email API without an idempotency token → tag each message with `delivery_uuid` for
+  bounce correlation; FCM uses the delivery uuid as the collapse key; the inbox uses `UNIQUE (notification_uuid,
+  recipient)`).
 
 ### 2.7 Scheduling, cancellation, snapshots
 
@@ -358,22 +364,24 @@ can be turned off; the inbox is always mandatory. **One function** (`Notificatio
 settings endpoint **and** by EXPAND — the UI's promise = the worker's behavior. Read from the primary; a failed read =
 EXPAND is retried. As soon as there are promotional notifications, an unsubscribe link is **required**.
 
-### 3.5 Email — Amazon SES (SDK v2, not SMTP)
+### 3.5 Email — the provider's API, not SMTP
 
-- `sesv2.SendEmail` with `Content.Simple` (Subject + Text + Html, UTF-8), From `"<Q-encoded Name> <no-reply@<domain>>"`.
-  SMTP was replaced because all its failures are opaque strings (a dead address used up 5 attempts over ±27 hours) and
-  `net/smtp` drops the MessageId (bounces cannot be joined).
-- Credentials come from the ECS **task role** (the access key pair is **left empty** on AWS). SES has **its own client**:
-  the process's `aws.Config` built for R2 (region `auto`) fails every send with symptoms that look like "an IAM problem".
-- Narrow classification: only `MessageRejected` = permanent; throttling, quota, paused account, unverified identity =
-  retryable.
-- `EmailTags: delivery_uuid=<idempotency_key>`; `SES_CONFIGURATION_SET` once bounces/complaints are wired to SNS.
-- IAM `ses:SendEmail` only, resource = the domain identity + `identity/*@<domain>` in the sending region (restricts the
-  From address). `SES_REGION` = the Terraform region variable that forms the ARN.
-- DNS via Terraform (verification, 3 DKIM CNAMEs — literal count 3, MAIL FROM, SPF, DMARC) and **request production
-  access from day one** ([08-aws-infrastructure.md](08-aws-infrastructure.md) §4.7).
-- Env: `SES_REGION`, `SES_FROM_ADDRESS` (required), `SES_FROM_NAME`, `SES_CONFIGURATION_SET`, `EMAIL_SINK_DIR` (local
-  only, [07-testing-and-e2e.md](07-testing-and-e2e.md)).
+- Send through the email provider's **HTTP API/SDK**: Subject + Text + HTML (UTF-8), From
+  `"<Q-encoded Name> <no-reply@<domain>>"`. SMTP was replaced because all its failures are opaque strings (a dead address
+  used up 5 attempts over ±27 hours) and `net/smtp` drops the message ID (bounces cannot be joined).
+- Credentials: the application's **runtime identity** where the platform offers it, otherwise a key in the secret store.
+  The email client has **its own configuration**: a provider config built for another service (e.g. the object storage's
+  region and keys) fails every send with symptoms that look like a permissions problem.
+- Narrow classification: only "message rejected" (bad recipient or content) = permanent; throttling, quota, a paused
+  account, an unverified identity = retryable.
+- Tag every message with its delivery's idempotency key (`delivery_uuid`), so bounces and complaints can be joined back
+  once they are wired in.
+- Permission to send **only from the product's domain**; the domain's DNS records (verification, DKIM, MAIL FROM, SPF,
+  DMARC) come from the infrastructure code, and the provider's sandbox is left **from day one**
+  ([08-infrastructure.md](08-infrastructure.md) §4.7).
+- Env: `…_FROM_ADDRESS` (required), `…_FROM_NAME`, the provider's region/settings, `EMAIL_SINK_DIR` (local only,
+  [07-testing-and-e2e.md](07-testing-and-e2e.md)).
+- The case study's SES setup: [01-backend-on-aws.md](../case-studies/aws-supabase-cloudflare/01-backend-on-aws.md) §4.7.
 
 ### 3.6 WhatsApp (Meta Cloud API, directly or through a reseller)
 
@@ -403,8 +411,8 @@ EXPAND is retried. As soon as there are promotional notifications, an unsubscrib
 
 - FCM HTTP v1 directly (`golang.org/x/oauth2/google` + one POST), not the Admin SDK (a heavy dependency for one
   endpoint). Timeout 15 s; one call per device.
-- Credentials = the whole service account JSON in SSM (filled from a file); the project id is read from the service
-  account (prevents project A's credentials from being paired with project B's id). Kill switch `PUSH_ENABLED`.
+- Credentials = the whole service account JSON in the secret store (filled from a file); the project id is read from the
+  service account (prevents project A's credentials from being paired with project B's id). Kill switch `PUSH_ENABLED`.
 - The push "address" = the **user**, not a token: tokens are read at send time (reminders wait for weeks; a snapshotted
   token has most likely rotated). ≥1 device receives → `SENT`; all tokens dead → permanent; any transient failure →
   retryable; payload rejected → permanent **without** touching the tokens.
@@ -435,16 +443,20 @@ Turning a channel off/on = one env change + apply, no deploy.
 ### 3.10 Admin emails and alerts
 
 Internal admin notifications go through the ordinary outbox (audience `ADMIN`, one row per admin, the actor is not
-notified, a switch per admin per type) — **except** error tracker alerts, which are sent **directly to SES** so they
-still go out when Postgres is the one in trouble. **The alert path must not depend on the system it watches.**
+notified, a switch per admin per type) — **except** error tracker alerts, which are sent **directly through the email
+provider** so they still go out when Postgres is the one in trouble. **The alert path must not depend on the system it
+watches.**
 
 ---
 
-## 4. Search (Typesense)
+## 4. Search
+
+A dedicated search engine that is fed through an outbox and only finds ids. The examples use Typesense (`filter_by`,
+collections, `typesense-go`); with another engine, keep the rules and translate the names.
 
 ### 4.1 Architecture
 
-- Postgres = source of truth; Typesense only **finds ids**. The query asks for `IncludeFields: "id"`, then the full rows
+- Postgres = source of truth; the engine only **finds ids**. The query asks for `IncludeFields: "id"`, then the full rows
   are hydrated from SQL (`WHERE uuid IN (…)`) and **re-sorted** by relevance. The search path's response is identical to
   the non-search path's.
 - **MUST** re-apply the owner scope/filters in the SQL hydration; rows still in the index but already gone are dropped
@@ -455,7 +467,7 @@ still go out when Postgres is the one in trouble. **The alert path must not depe
   owner-scoped; access to it is protected by the admin guard, and its documents hold no references to personal documents.
 - **(improvement)** escape `filter_by` values (Typesense backticks) or validate them strictly before assembling the
   filter — never assemble it by plain string concatenation.
-- **(improvement)** decide explicitly per endpoint what happens when Typesense is down: degrade to a bounded `ILIKE` or a
+- **(improvement)** decide explicitly per endpoint what happens when the engine is down: degrade to a bounded `ILIKE` or a
   clear 503.
 
 ### 4.2 Schemas & collections
@@ -479,11 +491,11 @@ still go out when Postgres is the one in trouble. **The alert path must not depe
 
 ### 4.4 Production & local
 
-- Production: one private EC2 instance, Typesense in Docker, data on a separate encrypted EBS volume, SG only from ECS,
-  `TYPESENSE_HOST` derived by Terraform, the API key is one Terraform variable for the server **and** SSM
-  ([08-aws-infrastructure.md](08-aws-infrastructure.md) §4.5).
-- **MUST** pin one Typesense version, the same in production and locally (never e.g. 27.1 in production and 30.2 locally).
-- Local: one container per session, bind `127.0.0.1`, dummy API key. **MUST NOT** use production Typesense from local.
+- Production: wherever the project runs it, with its data on a separate persistent volume, reachable only from the
+  application hosts, its address derived by the infrastructure code, and its API key one variable for the server **and**
+  the secret store ([08-infrastructure.md](08-infrastructure.md) §4.5).
+- **MUST** pin one engine version, the same in production and locally (never e.g. 27.1 in production and 30.2 locally).
+- Local: one container per session, bind `127.0.0.1`, dummy API key. **MUST NOT** use the production engine from local.
 
 ---
 
@@ -503,10 +515,11 @@ still go out when Postgres is the one in trouble. **The alert path must not depe
   - the scenario is encoded in the authorization code (`fake:<sub>:<email>[:norefresh|:noscope]`) → no setup;
   - every access token expires immediately → the refresh path is exercised on every call;
   - a `/_fake/*` control plane for tests: revoke, force 401, inject events, read call counters;
-  - the logs fake implements only `FilterLogEvents` and deliberately ignores the filter pattern (tests prove the parser
-    rejects non-errors);
+  - the log store fake implements only the one read the error tracker uses, and deliberately ignores the filter pattern
+    (tests prove the parser rejects non-errors);
   - an in-memory, path-style S3 fake without auth that also serves GETs like a CDN;
-  - DynamoDB Local + a command that creates the local tables (rejects non-local endpoints).
+  - a local copy of the error tracker's key-value store + a command that creates the local tables (rejects non-local
+    endpoints).
 - **Webhook sink** for new integrations: a small server behind a tunnel that stores the body **byte for byte** + the
   headers + the verification result, and can forward to a local server and answer a chosen status to observe the
   provider's retries. **MUST NOT** re-encode JSON before HMAC verification.
@@ -530,7 +543,7 @@ still go out when Postgres is the one in trouble. **The alert path must not depe
   notification **once per mark**.
 - **MUST** verify deauthorize/data-deletion webhooks before reading them (HMAC over the raw body, `hmac.Equal`, timestamp
   ≤ 5 minutes, empty secret → 503, failure to delete → 5xx so the provider retries).
-- Releasing a new secret: fill SSM **before** the `app_secret_keys` change reaches `main`.
+- Releasing a new secret: fill the secret store **before** the change that references it reaches `main`.
 
 ### 5.3 The payment gateway as a separate library
 
@@ -549,13 +562,13 @@ still go out when Postgres is the one in trouble. **The alert path must not depe
   unknown, replays are **manual**, through a `--commit` command.
 - **Sandbox by default**: only the exact value `true` in `…_PRODUCTION` points to production; an unknown value = error.
   All env values are trimmed (a newline from a secret mount breaks the HMAC).
-- Egress through a NAT with a fixed EIP (`prevent_destroy`), registered in the gateway's IP allowlist (rejections show up
-  as business codes, easy to misdiagnose).
+- Egress through a fixed IP (the NAT's, protected from deletion), registered in the gateway's IP allowlist (rejections
+  show up as business codes, easy to misdiagnose).
 - The platform account at the gateway is created **once per environment, by hand**.
 
 ### 5.4 The server calling paid APIs / fetching third-party URLs
 
-- The server API key is separate from the browser key, restricted to the APIs in use and to the **NAT IP**; minimal
+- The server API key is separate from the browser key, restricted to the APIs in use and to the **fixed egress IP**; minimal
   field mask; short timeout, not retried on the request path (failure → estimate); results cached in Redis (e.g. 24
   hours). Prices charged to users are stored in Postgres.
 - Server-side fetches of URLs from input/imports: host allowlist, `https` only, a size limit (e.g. 2 MB), no redirects to
@@ -565,7 +578,8 @@ still go out when Postgres is the one in trouble. **The alert path must not depe
 
 ## 6. Object storage from the worker side
 
-The full R2 rules (buckets, client, presign, naming, deletion) are in [09-cloudflare.md](09-cloudflare.md) §4.
+The full object storage rules (buckets, client, presign, naming, deletion) are in
+[09-frontend-and-storage.md](09-frontend-and-storage.md) §4.
 Worker-specific:
 
 - Derived objects (OG cards) are **content-addressed** (key = hash(design version + input)), uploaded with

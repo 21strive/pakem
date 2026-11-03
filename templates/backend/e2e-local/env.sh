@@ -13,5 +13,5 @@
 export E2E_APP E2E_DB E2E_PGHOST E2E_PGPORT E2E_PGUSER E2E_PORT E2E_REDIS_PORT E2E_RUN_DIR
 # Optional fake ports (empty = not started): third-party stand-ins in scripts/e2e/fake*/
 export E2E_FAKE_OAUTH_PORT="${E2E_FAKE_OAUTH_PORT:-}"
-export E2E_FAKE_R2_PORT="${E2E_FAKE_R2_PORT:-}"
+export E2E_FAKE_S3_PORT="${E2E_FAKE_S3_PORT:-}"   # object storage (S3 API)
 export PGHOST="$E2E_PGHOST" PGPORT="$E2E_PGPORT" PGUSER="$E2E_PGUSER"

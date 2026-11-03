@@ -277,7 +277,7 @@ recovery & the account-deletion form.
 - Date ranges `start_date`/`end_date` in `YYYY-MM-DD` come in pairs, verified by round-trip (31 February is rejected),
   `start ≤ end`, with a per-endpoint limit on the range length.
 - Sorting only from a whitelist (`sort_by: date|amount|name`, `sort_dir: asc|desc`).
-- Text search through Typesense: fetch one page of uuids from the engine → read the rows from Postgres, keeping the
+- Text search through the search engine: fetch one page of uuids from the engine → read the rows from Postgres, keeping the
   relevance order → filter again in Postgres (role, owner) → drop stale documents → `total` from the engine. **MUST** send
   the owner filter to the engine as well (`user_uuid:=…`); a search without an owner is rejected.
 
@@ -472,8 +472,8 @@ written.
 
 ### 6.3 Secrets & keys
 
-- Production: secrets in SSM → task definition `secrets.valueFrom`; non-secret switches as plain env
-  ([08-aws-infrastructure.md](08-aws-infrastructure.md) §3).
+- Production: secrets in the platform's secret store, injected as env when the container starts; non-secret switches as
+  plain env from the committed infra settings ([08-infrastructure.md](08-infrastructure.md) §3).
 - **MUST (improvement):** only `.env.example` (placeholders) is committed; every other `.env*` is in `.gitignore`;
   **a secret scanner (gitleaks) in CI**. Never track developer env files such as `.env.local`/`.env.staging`.
 - **MUST NOT** put credentials in code comments.
@@ -486,7 +486,7 @@ written.
 ### 6.4 Rate limiting
 
 - **MUST (improvement)** a per-IP **and** per-identity limiter for login, register, refresh, and public endpoints that
-  write data; **SHOULD** add a rate-based rule in the Cloudflare WAF.
+  write data; **SHOULD** add a rate-based rule at the edge (WAF).
 - Proven per-feature throttles:
 
 | Feature | Limit | Stored in | Response |
@@ -513,12 +513,12 @@ written.
   `AllowCredentials: false` unless cookies are used; write origins without a trailing slash.
 - CORS is **not** a security boundary for a bearer API — it only governs browsers.
 
-### 6.6 Presigned URLs (R2)
+### 6.6 Presigned URLs (object storage)
 
 - **Upload:** the server mints the key `<prefix>/<caller_uuid>/<sub>/<uuidv7>.<ext>` → the client `PUT`s directly (URL
   valid for 1 hour) → the client confirms the key to the owner's endpoint, which validates the folder.
   **MUST** the presigned PUT signs `ContentType` **and**
-  `ContentLength` (R2 rejects any other type/size) and returns the `content_type` the client must send (`File.type` in
+  `ContentLength` (the store rejects any other type/size) and returns the `content_type` the client must send (`File.type` in
   the browser is often empty).
 - **Reading private objects:** `ResponseChecksumValidation = WhenRequired` (only `host` is signed — `x-amz-checksum-mode`
   makes `<img>` get a 403; incident: KYC images broken for two months; a test asserts `X-Amz-SignedHeaders == host`);
@@ -527,7 +527,7 @@ written.
 - **SHOULD** use a *windowed presigner*: the signing time is rounded down to the start of the window, `X-Amz-Expires` =
   2× the window → the URL stays the same for one window, so the browser can cache it.
 - PII in a private bucket without a public host; public assets in a public bucket with a custom domain. **MUST NOT** log
-  signed URLs. R2 details: [09-cloudflare.md](09-cloudflare.md) §4.
+  signed URLs. Storage details: [09-frontend-and-storage.md](09-frontend-and-storage.md) §4.
 
 ### 6.7 Incoming webhooks
 
@@ -597,8 +597,8 @@ f.Get("/queue", queueFlag, oauthMiddleware, access(view(models.PAGE_QUEUE)), que
   the route.
 - Staged validation switches `off|log|enforce`: **(improvement)** an empty value = `off`/`log` or fail to start — never
   `enforce` (it once closed all of `/admin/*` with a 503 when the deploy went out before the env).
-- The switch inventory (env, default, effect when off) is maintained in the project's platform doc and in the tfvars
-  comments.
+- The switch inventory (env, default, effect when off) is maintained in the project's platform doc and in the comments
+  of the committed infra settings.
 
 ### 7.1 Client side
 

@@ -1,8 +1,10 @@
 # 06 — Observability: logs, traces, error tracker, metrics, latency
 
-Observability is built from **structured logs to stdout** collected by CloudWatch Logs, plus **our own error tracker**
-(CloudWatch → DynamoDB → SES email) that replaces Sentry for the backend, a CloudWatch dashboard from Terraform, and Logs
-Insights queries for latency & tracing. No additional observability agent or SaaS.
+Observability is built from **structured logs to stdout** collected by the platform's log store, plus **our own error
+tracker** (log store → a small store outside the main database → email) that replaces Sentry for the backend, a dashboard
+from the infrastructure code, and saved log queries for latency & tracing. No additional observability agent or SaaS.
+Which log store, key-value store, and email provider fill those roles is the project's decision; the
+[case study](../case-studies/aws-supabase-cloudflare/04-observability-on-aws.md) shows one set.
 
 Markers: **MUST / MUST NOT / SHOULD**. **(improvement)** = a lesson from production incidents that is not common practice yet; required for new projects.
 
@@ -13,13 +15,13 @@ Markers: **MUST / MUST NOT / SHOULD**. **(improvement)** = a lesson from product
 - **MUST** use `log/slog` JSON to **stdout**, `AddSource: true` (fields `source.function/file/line`), one global logger
   (`helper.SetLogger` + `slog.SetDefault`) installed in `main.init()` before anything else — all three modes (API,
   worker, command) are covered.
-- Container stdout → the `awslogs` driver → log groups `/ecs/<prefix>/api` and `/ecs/<prefix>/worker`, **30-day
-  retention** (Terraform). No additional agent.
+- Container stdout → the platform's log driver → one log group/stream per service (API, worker), **30-day retention**
+  set by the infrastructure code. No additional agent.
 - HTTP access lines = Fiber's `logger` middleware: `HH:MM:SS | <status> | <latency> | <ip> | <METHOD> | <path> | <error>`.
   Panics recovered by `recover` (with stack trace) go to stderr as `panic: …`.
-- **(improvement)** access lines include `trace_id` (`${locals:trace_id}`) and the real client IP (behind Cloudflare:
-  `CF-Connecting-IP`; or `ProxyHeader` + a trusted proxy check) — otherwise access lines can be joined to ERROR lines
-  only by time+path, and the IP column holds the load balancer's IP.
+- **(improvement)** access lines include `trace_id` (`${locals:trace_id}`) and the real client IP (behind an edge proxy:
+  the client-IP header the edge sets, or `ProxyHeader` + a trusted proxy check) — otherwise access lines can be joined to
+  ERROR lines only by time+path, and the IP column holds the load balancer's IP.
 - Request milestones: a controller may write INFO "started"/"done" with `trace_id` + the operation name to reconstruct
   the request's journey.
 - Levels: `Debug` on the base handler; ERROR for server faults, WARN for 4xx and expected failures.
@@ -50,28 +52,29 @@ a settlement webhook was rejected three times with a log that only said "Invalid
   personal keys masked (`name`, `email`, `phone`, `mobile`, `msisdn`, `address`, `account_number`, `va_number`, `card`,
   `nik`, `npwp`, `birth`, `title`, `description`, `remark`, `note` — a key that **contains** one of these parts is masked
   together with its contents);
-- a body that is not JSON and would need masking → not logged; limit 64 KB; the body is logged as nested JSON (Logs
-  Insights can read its fields); the ERROR carries the parser's error text (the error tracker group names the field that
-  changed);
+- a body that is not JSON and would need masking → not logged; limit 64 KB; the body is logged as nested JSON (the log
+  store's query language can read its fields); the ERROR carries the parser's error text (the error tracker group names
+  the field that changed);
 - provider error bodies are logged **truncated** (512 bytes).
 
 ## 4. Error tracker (Sentry replacement for the backend)
 
 **User decision (21 October 2026):** an error list + email alerts without Sentry's cost; a worker reads the logs
 periodically, no LLM; one record per error type (count + last occurrence); recipients managed from the internal
-dashboard; **no load on the main infra** → DynamoDB on-demand, not Postgres. Live on 27 October 2026, it immediately found
-old errors nobody had ever known about — that is exactly where the tool's value lies.
+dashboard; **no load on the main infra** → a small key-value store billed per request, not Postgres. On its first day in
+production it found old errors nobody had ever known about — that is exactly where the tool's value lies.
 
 ### 4.1 Architecture
 
 ```
-api/worker → slog JSON + stderr → CloudWatch Logs
-                                      │ FilterLogEvents every minute
+api/worker → slog JSON + stderr → log store
+                                      │ read new lines every minute
                                       ▼
-                         worker error-tracker ──► DynamoDB on-demand (groups, recipients, checkpoint)
+                         worker error-tracker ──► key-value store (groups, recipients, checkpoint)
                                       │                    ▲
                                       ▼                    │ endpoint /admin/errors…
-                               email alert via SES   internal dashboard (Errors page)
+              email alert, sent directly through    internal dashboard (Errors page)
+              the email provider
 ```
 
 It keeps running when Postgres has problems (a full-pooler incident is exactly the kind that must raise an alert);
@@ -79,7 +82,7 @@ Postgres is read only for the list of admin recipients, and if that read fails, 
 
 ### 4.2 Lines that are counted
 
-- The filter pattern `?"\"level\":\"ERROR\"" ?"panic: " ?"fatal error: "` only narrows the set; each line is parsed
+- The log store's filter (for `"level":"ERROR"`, `panic: `, `fatal error: `) only narrows the set; each line is parsed
   again: JSON `level=ERROR` (text = the `error` field, or `msg` when absent; location = `source.function`), `panic: …`
   (PANIC), `fatal error: …` (FATAL).
 - **Not** counted: WARN/INFO, `| 500 |` access lines (a 500 through `SendResponse` already has an ERROR line), stack
@@ -99,14 +102,15 @@ Postgres is read only for the list of admin recipients, and if that read fails, 
 - Time is cut into `ERROR_TRACKER_BUCKET` slices (1 minute); a slice is read once it is `ERROR_TRACKER_SETTLE` old
   (2 minutes, so late lines have arrived); one pass runs from the checkpoint to the last ready slice, max 360 slices
   (6 hours); falling behind → the next pass after 1 s.
-- Per (slice, group) an `UpdateItem` with
-  `ConditionExpression: attribute_not_exists(last_bucket) OR last_bucket < :bucket` (`ADD count`, `if_not_exists` for
-  first_seen/status); the checkpoint is advanced on the condition that it still holds the old value. The first pass goes
-  back `ERROR_TRACKER_BACKFILL` (7 days). **Two processes are safe.**
+- Per (slice, group) one **conditional update**: add the slice's count only if the group's `last_bucket` is missing or
+  older than this slice (set first_seen/status only when absent); the checkpoint is advanced on the condition that it
+  still holds the old value. Any store with conditional writes works. The first pass goes back `ERROR_TRACKER_BACKFILL`
+  (7 days). **Two processes are safe.**
 
-### 4.5 DynamoDB table
+### 4.5 The store
 
-`<prefix>-error-tracker`, `PAY_PER_REQUEST`, `pk` + `sk`, deletion protection + `prevent_destroy`:
+One table `<prefix>-error-tracker` in a key-value store billed per request, keyed `pk` + `sk`, with deletion protection
+(it holds the recipient list & the statuses admins set):
 
 | Item | Contents |
 |---|---|
@@ -114,7 +118,7 @@ Postgres is read only for the list of admin recipients, and if that read fails, 
 | `RECIPIENT/<lowercase email>` | extra recipient |
 | `STATE/checkpoint` | next_bucket, updated_at |
 
-Times = unix ms. Cost at a small SaaS's volume: ±$0.03–0.07/month.
+Times = unix ms. Cost at a small SaaS's volume: cents per month.
 
 ### 4.6 Status & alerts
 
@@ -124,19 +128,20 @@ Times = unix ms. Cost at a small SaaS's volume: ±$0.03–0.07/month.
   per hour); slices > 1 hour old (backfill/catch-up) are counted but not emailed; one email per pass, all recipients in
   `To`; failed emails are held in memory (max 50) for the next pass; extra recipients max 20 + every admin who has not
   turned off "Error alerts".
-- Alerts are sent **directly to SES**, not through the notification outbox (the alert path does not depend on Postgres).
+- Alerts are sent **directly through the email provider**, not through the notification outbox (the alert path does not
+  depend on Postgres).
 
-### 4.7 API, IAM, env
+### 4.7 API, permissions, env
 
-- Admin API (404 while the switch is off): `GET/PATCH /admin/errors[/{id}]` (the detail includes a CloudWatch console
-  link for ±1 minute), `GET/POST/DELETE /admin/error-alert-recipients`, `POST …/test`.
-- IAM task role (narrow): `dynamodb:GetItem/PutItem/UpdateItem/DeleteItem/Query` on one table, `logs:FilterLogEvents` on
-  two log groups (ARN and `ARN:*`), `ses:SendEmail`.
-- Env: `ERROR_TRACKER_ENABLED` (default false; instant rollback), `ERROR_TRACKER_TABLE`, `ERROR_TRACKER_REGION`,
-  `ERROR_TRACKER_LOG_GROUPS` (all three **derived by Terraform**), `ERROR_TRACKER_DASHBOARD_URL`,
-  `…_POLL_INTERVAL/_BUCKET/_SETTLE/_BACKFILL` (1m/1m/2m/168h; e2e 1s/2s/2s/1m), `…_DYNAMODB_ENDPOINT/_LOGS_ENDPOINT`
-  (local only; rejected outside `ENVIRONMENT=local`).
-- E2E: a fake CloudWatch Logs + DynamoDB Local + a command that creates the local table
+- Admin API (404 while the switch is off): `GET/PATCH /admin/errors[/{id}]` (the detail includes a link to the log
+  store's console for ±1 minute), `GET/POST/DELETE /admin/error-alert-recipients`, `POST …/test`.
+- The application identity (narrow): item operations on one table, reading the two log groups, sending email
+  ([08-infrastructure.md](08-infrastructure.md) §4.6).
+- Env: `ERROR_TRACKER_ENABLED` (default false; instant rollback), the table, region, and log group names (**derived by the
+  infrastructure code**), `ERROR_TRACKER_DASHBOARD_URL`, `…_POLL_INTERVAL/_BUCKET/_SETTLE/_BACKFILL`
+  (1m/1m/2m/168h; e2e 1s/2s/2s/1m), and endpoint overrides for the store and the log store (local only; rejected outside
+  `ENVIRONMENT=local`).
+- E2E: a fake log store + a local copy of the key-value store + a command that creates the local table
   ([07-testing-and-e2e.md](07-testing-and-e2e.md)).
 
 ### 4.8 Known limitations
@@ -153,40 +158,30 @@ crashes, full stacks for ERROR lines, breadcrumbs, release tracking.
 - **Sentry:** the error tracker replaces Sentry for backend errors. Keeping a Sentry SDK only for metrics means that
   emptying `SENTRY_DSN` silently turns every metric into a no-op.
 - **Recommendation for new projects (open decision):** do not install Sentry in the backend; errors = the error tracker
-  §4; metrics = **CloudWatch Embedded Metric Format** (`_aws` JSON lines on the same stdout, no agent/SDK) or metric
+  §4; metrics = **metric lines on the same stdout** that the log platform turns into metrics (no agent/SDK), or metric
   filters on the log group. Keep the `RecordXxx` wrapper shape so the metrics backend can be swapped without touching
   business code.
 
-## 6. Latency & tracing (CloudWatch Logs Insights)
+## 6. Latency & tracing (saved log queries)
 
-- Use **Logs Insights** (`aws logs start-query` / `get-query-results`; 30 days in seconds). `filter-log-events` over 7
-  days can take more than 2 minutes.
-- Latency from Fiber access lines:
-  ```
-  fields @timestamp, @message
-  | parse @message /\| (?<status>\d{3}) \|\s+(?<lat>[0-9.]+)(?<unit>[^ ]+) \| (?<ip>[^ ]+) \| (?<method>[A-Z]+) \| (?<path>[^ ]+) \|/
-  | filter ispresent(status)
-  | stats count(*) as n, pct(lat, 50) as p50, pct(lat, 95) as p95, max(lat) as worst by unit, method
-  ```
-  (the µs/ms/s units are converted outside the query; paths contain UUIDs → aggregate per route pattern outside the
-  query).
-- All ERRORs / one `error_id` from a user report / one request:
-  ```
-  fields @timestamp, msg, error, error_id, trace_id, operation_name, source.function
-  | filter level = "ERROR"            # or: error_id = "ERR_…"  /  trace_id = "<uuid>"
-  | sort @timestamp desc
-  ```
-- Logged webhook bodies: `filter @message like /"msg":"<Provider>\w+ (body|refused)"/`.
-- A complement without parsing: the ALB `TargetResponseTime` p50/p95/p99 widget on the dashboard.
+- Use the log store's **query engine** for anything over more than a few hours; scanning raw lines over days is slow
+  (over 7 days it can take minutes). Keep the queries below in the project's runbook, written in its log store's
+  language (the case study has them in its log store's query language).
+- **Latency** from Fiber access lines: parse `| <status> | <latency><unit> | <ip> | <METHOD> | <path> |`, then count and
+  take p50/p95/max per method (convert the µs/ms/s units outside the query; paths contain UUIDs → aggregate per route
+  pattern outside the query).
+- **All ERRORs / one `error_id` from a user report / one request:** filter on `level = "ERROR"`, `error_id = "ERR_…"`, or
+  `trace_id = "<uuid>"`; show `msg`, `error`, `error_id`, `trace_id`, `operation_name`, `source.function`, newest first.
+- **Logged webhook bodies:** the lines whose `msg` is `<Provider>… body` or `<Provider>… refused`.
+- A complement without parsing: the load balancer's response-time percentiles (p50/p95/p99) on the dashboard.
 
 ## 7. Dashboard & alarms
 
-- One CloudWatch dashboard in Terraform: ALB (requests, application vs ALB 5xx, 4xx, `TargetResponseTime` p50/p95/p99,
-  healthy/unhealthy hosts), ECS per service (CPU, memory, running vs desired tasks), cluster & EC2 hosts. Agentless
-  sources: `AWS/ApplicationELB`, `AWS/ECS`, `AWS/EC2`, `ECS/ContainerInsights` (Container Insights enabled). Free tier:
-  3 dashboards × 50 metrics — count before adding widgets.
-- **(improvement)** minimum alarms: `RunningTaskCount < 1` for the API and worker services + rising ALB 5xx → SNS email
-  (a worker that failed 146 times once went unnoticed until the circuit breaker was installed).
+- One dashboard from the infrastructure code: the load balancer (requests, application vs load-balancer 5xx, 4xx,
+  response time p50/p95/p99, healthy/unhealthy hosts), each service (CPU, memory, running vs desired instances), and the
+  hosts/capacity. Use the platform's built-in metrics (no agent), and check the free-tier limits before adding widgets.
+- **(improvement)** minimum alarms: running instances < 1 for the API and worker services + rising load-balancer 5xx →
+  email (a worker that failed 146 times once went unnoticed until the circuit breaker was installed).
 - Workers that guard business invariants emit an ERROR when an invariant is violated, so it lands in the error tracker
   ([05-workers-and-integrations.md](05-workers-and-integrations.md) §1.2).
 

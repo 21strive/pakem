@@ -3,6 +3,10 @@
 A summary of the decisions that shape every other document. When in doubt while designing something, come back to this
 list. Each item links to the document that explains how and why.
 
+These are decisions about **how the backend is built**. Pakem does not decide which products or services it runs on —
+cloud, managed database, CPU architecture, container platform, CDN, storage, email, logs: those belong to the project
+(§F 22).
+
 ## A. Data
 
 1. **PostgreSQL is the only source of truth.** Redis is only for a rebuildable cache, short-lived state (short TTL; losing
@@ -54,8 +58,8 @@ list. Each item links to the document that explains how and why.
     without a data change.
 17. **API documentation is a deliverable**: Swagger annotations + a manual Postman collection + a handoff prompt for the
     frontend/mobile teams. A feature is not done until all three exist. → [03-api-design.md](03-api-design.md)
-18. **Files never go through the API.** Clients upload straight to R2 with a presigned PUT; private files are read with a
-    short-lived presigned GET after an access check. → [09-cloudflare.md](09-cloudflare.md) §4
+18. **Files never go through the API.** Clients upload straight to object storage with a presigned PUT; private files are
+    read with a short-lived presigned GET after an access check. → [09-frontend-and-storage.md](09-frontend-and-storage.md) §4
 
 ## E. Side effects & integrations
 
@@ -68,12 +72,16 @@ list. Each item links to the document that explains how and why.
 
 ## F. Infrastructure & releases
 
-22. **Topology:** backend on AWS (ECS on EC2 Graviton arm64 behind an ALB that only accepts Cloudflare), Supabase Postgres
-    through the pooler, Redis Cloud, Typesense on a private EC2 instance; **frontend, object storage, DNS, and edge on
-    Cloudflare**. → [08-aws-infrastructure.md](08-aws-infrastructure.md), [09-cloudflare.md](09-cloudflare.md)
-23. **All infra is Terraform** in a separate infra repo; non-secret settings committed in `prod.tfvars` with comments that
-    explain their reason and history; secrets in SSM Parameter Store (only names in the repo); CI uses OIDC without static
-    credentials.
+22. **Products and services are the project's decision, not the blueprint's.** Pakem fixes the roles and what each must
+    do — one image as an API service and a worker service behind a load balancer that only the edge can reach; Postgres
+    behind a pooler; Redis; a private search engine; S3-compatible object storage; static frontend hosting with an edge
+    function; one fixed egress IP — and the project picks the cloud, managed services, CPU architecture, and providers
+    that fill them, recording each choice in its `AGENTS.md`. The
+    [case study](../case-studies/aws-supabase-cloudflare/README.md) shows one such set; it is an illustration, not a
+    default. → [08-infrastructure.md](08-infrastructure.md), [09-frontend-and-storage.md](09-frontend-and-storage.md)
+23. **All infra is code** in a separate infra repo; non-secret settings committed with comments that explain their reason
+    and history; secrets in a secret store (only names in the repo); CI uses federated, short-lived credentials (OIDC),
+    never static keys.
 24. **Backend deploys are manual and controlled** (`workflow_dispatch`), one at a time, verified until the new tasks run the
     right image. Backend first, clients next.
 25. **No mandatory backend staging.** Validation = local E2E against the production schema (+ a dump copy for migrations) and

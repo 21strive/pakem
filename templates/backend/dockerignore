@@ -4,7 +4,7 @@
 .git
 .gitignore
 
-# Local configuration. The image ships an empty .env; the real configuration comes from ECS.
+# Local configuration. The image ships an empty .env; the real configuration comes from the platform as env.
 .env*
 .vscode
 .idea

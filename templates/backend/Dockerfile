@@ -1,5 +1,5 @@
 # Template — replace <org>, <app>, <module>, <port>.
-# One image for API and worker; ECS picks the mode through `command` (["main"] / ["worker"]).
+# One image for API and worker; each service picks the mode through its command (["main"] / ["worker"]).
 FROM golang:1.25-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
@@ -13,7 +13,7 @@ WORKDIR /app
 COPY . .
 RUN go mod download
 
-# Commit and build time (deploy.yml passes github.sha and epoch seconds). They become buildinfo.Revision —
+# Commit and build time (the deploy workflow passes the commit SHA and epoch seconds). They become buildinfo.Revision —
 # the generation of the redifu cache indexes/records — and buildinfo.Time — which build is newer when two builds
 # share Redis during a rolling deploy. A build without both runs as "dev" and logs a WARN.
 ARG GIT_SHA=""
@@ -30,7 +30,7 @@ WORKDIR /<app>
 COPY --from=builder /app/<app> /<app>/<app>
 
 # config.InitConfig() calls godotenv.Load() and fails if .env is missing, so the file must exist —
-# but EMPTY: ECS injects the real configuration as env, and godotenv does not override env that is already set.
+# but EMPTY: the platform injects the real configuration as env, and godotenv does not override env that is already set.
 RUN touch /<app>/.env
 
 EXPOSE <port>

@@ -8,11 +8,16 @@ Short checklists. Every item points to the document that explains how and why.
 
 ### A0. Initial decisions (ask them together, with defaults)
 
-- [ ] Project name/`<project>`, Go module `github.com/<org>/<app>`, product domain, AWS region (default: the region closest
-      to the users, e.g. `ap-southeast-1`), product language for end-user text.
+- [ ] Project name/`<project>`, Go module `github.com/<org>/<app>`, product domain, region (default: the region closest
+      to the users), product language for end-user text.
 - [ ] Repos to create: BE, infra, web, (dashboard), (mobile), (edge). Main branch name per repo.
 - [ ] Money unit (default: bigint in whole currency units), the platform's business time zone (for fixed schedules).
-- [ ] Accounts: a dedicated AWS account, a Supabase project, Redis Cloud, a Cloudflare zone, GitHub org/secrets.
+- [ ] **Providers — the project's decision, not pakem's:** cloud & container platform (+ CPU architecture), Postgres host
+      and its pooler, Redis host, search engine, object storage, frontend hosting & edge, DNS, email, log store, secret
+      store, IaC tool, CI. Record each choice and the requirement it meets in the project's `AGENTS.md` §1. The
+      [case study](../case-studies/aws-supabase-cloudflare/README.md) is one worked set of choices, not a default.
+- [ ] Accounts at the chosen providers: a dedicated cloud account/project for the product, the Postgres and Redis hosts,
+      the DNS zone, the code host's org/secrets.
 
 ### A1. Backend repo & skeleton ([01-architecture.md](01-architecture.md))
 
@@ -33,7 +38,8 @@ Short checklists. Every item points to the document that explains how and why.
       recover, `FeatureFlagMiddleware`, auth (bearer → session → user), `AdminOnly`.
 - [ ] Providers (`RepositoryProvider`, `UseCaseProvider`), `GET /health` (503 only when the pool is exhausted).
 - [ ] Guard tests from day one: `TestArchitecture` (empty baseline), `TestErrorLogCalls`, route access test, CORS test.
-- [ ] `Dockerfile`, `.dockerignore`, `Makefile`, `.github/workflows/deploy.yml` from [templates/backend/](../templates/backend/).
+- [ ] `Dockerfile`, `.dockerignore`, `Makefile` from [templates/backend/](../templates/backend/); a manual deploy workflow
+      for the chosen CI and platform ([08-infrastructure.md](08-infrastructure.md) §6).
 - [ ] `.gitignore` covers every `.env*` except `.env.example`; gitleaks in CI.
 
 ### A2. Database ([02-database.md](02-database.md))
@@ -63,7 +69,7 @@ Short checklists. Every item points to the document that explains how and why.
 
 - [ ] `runWithSignal` + `safeTick` + WaitGroup; `worker --check` in CI.
 - [ ] Notification catalog in code, embedded templates + fixtures, boot gate, kill switch per channel, local email sink.
-- [ ] Typesense: schema in code, `Ensure*Collection`, indexer fed by a signal outbox, owner-scoped SQL hydration.
+- [ ] Search: schema in code, idempotent `Ensure*Collection`, indexer fed by a signal outbox, owner-scoped SQL hydration.
 
 ### A6. Cache ([04-caching.md](04-caching.md) §12)
 
@@ -72,28 +78,30 @@ Short checklists. Every item points to the document that explains how and why.
 
 ### A7. Observability ([06-observability.md](06-observability.md))
 
-- [ ] Error tracker (worker + DynamoDB table + admin endpoints + dashboard page), metrics wrapper, CloudWatch dashboard &
-      alarms, Logs Insights queries in a runbook.
+- [ ] Error tracker (worker + its key-value store + admin endpoints + dashboard page), metrics wrapper, dashboard &
+      alarms, saved log queries in a runbook.
 
-### A8. AWS infrastructure ([08-aws-infrastructure.md](08-aws-infrastructure.md))
+### A8. Infrastructure ([08-infrastructure.md](08-infrastructure.md))
 
-- [ ] A dedicated AWS account + a named CLI profile.
-- [ ] Outside values: Cloudflare token (DNS Edit, one zone), zone ID, Origin Certificate → ACM, SSL Full (strict),
-      Typesense API key.
-- [ ] Repo `<project>-prod-infra`: `bootstrap/` (state bucket, lock table, OIDC + terraform & deploy roles) → apply from a
-      laptop.
-- [ ] `terraform/prod.tfvars` from [templates/infra/prod.tfvars.example](../templates/infra/prod.tfvars.example);
-      `terraform.tfvars` (local secrets); first apply from a laptop.
-- [ ] First `linux/arm64` image into ECR; the services come up.
-- [ ] GitHub Secrets (infra: `AWS_TERRAFORM_ROLE_ARN`, `CLOUDFLARE_API_TOKEN`, `TF_VAR_*`; BE: `AWS_DEPLOY_ROLE_ARN`,
-      `GOPRIVATE_TOKEN`); `terraform.yml` from the template.
-- [ ] SSM filled (`put-secrets.sh`); SES production access requested; circuit breaker on both services.
+- [ ] A dedicated cloud account for the product + a named CLI profile.
+- [ ] Outside values: the DNS provider token (DNS edit, one zone), the zone ID, the origin certificate, TLS verified end
+      to end, the search engine API key.
+- [ ] Repo `<project>-prod-infra`: `bootstrap/` (state storage, lock, CI federation + IaC & deploy identities) → apply
+      from a laptop.
+- [ ] The committed settings file (every key commented) + the local secrets file; first apply from a laptop. A filled-in
+      example: the case study's [`prod.tfvars.example`](../case-studies/aws-supabase-cloudflare/templates/prod.tfvars.example).
+- [ ] First image (built for the hosts' architecture) into the registry; the services come up.
+- [ ] CI secrets (infra: the IaC identity, the DNS provider token, IaC secret variables; BE: the deploy identity,
+      `GOPRIVATE_TOKEN`); the infra CI workflow (plan on PR, apply on `main`).
+- [ ] Secret store filled (`put-secrets.sh`); the email provider's sandbox left; circuit breaker + rollback on both
+      services.
 
-### A9. Cloudflare ([09-cloudflare.md](09-cloudflare.md))
+### A9. Frontend, edge, storage ([09-frontend-and-storage.md](09-frontend-and-storage.md))
 
-- [ ] Pages for the web app (`<project>-fe-main`, optional `-staging`) + the internal dashboard, Git integration.
-- [ ] R2: a public bucket + custom domain `cdn.<domain>`, a private bucket, bucket CORS, R2 access key in SSM.
-- [ ] Edge Worker (when bots need SEO/OG or there are alias domains) with `[env.staging]`/`[env.main]`.
+- [ ] Static hosting with Git deploys for the web app (optional staging) + the internal dashboard.
+- [ ] Object storage: a public bucket + custom domain `cdn.<domain>`, a private bucket, bucket CORS, an access key per
+      bucket/app in the secret store.
+- [ ] Edge function (when bots need SEO/OG or there are alias domains) with staging and production environments.
 - [ ] Backend CORS covers every origin; reserved usernames in sync between backend and web.
 
 ---
@@ -143,7 +151,7 @@ provider → unit parity → E2E parity → guard tests → docs → release).
 
 - [ ] Client (wire format) and sender/usecase (decisions) kept apart; timeouts; error classification; credentials checked at
       construction.
-- [ ] Secrets in SSM (filled before their reference reaches `main`); base-URL overrides only in local.
+- [ ] Secrets in the secret store (filled before their reference reaches `main`); base-URL overrides only in local.
 - [ ] Webhooks: HMAC over the raw body, constant-time, anti-replay, fail-closed, idempotent, masked body logging.
 - [ ] A fake for E2E (+ control plane), a webhook sink for first observations.
 - [ ] A kill switch when it is paid/risky; a setup runbook.
@@ -151,11 +159,11 @@ provider → unit parity → E2E parity → guard tests → docs → release).
 ## H. Release
 
 - [ ] Deploy lock taken; base re-checked; the release contains only what was tested ([10-workflow.md](10-workflow.md) §6.5).
-- [ ] Pre-deploy migrations (approval) → `--no-ff` merge (message summarizes the impact) → `deploy.yml` →
-      `gh run watch --exit-status` → `services-stable` → digest = tag → clean logs → probes
-      ([08-aws-infrastructure.md](08-aws-infrastructure.md) §6).
-- [ ] Post-deploy migrations → web/dashboard (Pages check + live bundle) → mobile push only (no workflow) → feature switches
-      (infra apply) → post-release work.
+- [ ] Pre-deploy migrations (approval) → `--no-ff` merge (message summarizes the impact) → the deploy workflow → watched
+      in the foreground → both services stable → running digest = tag digest → clean logs → probes
+      ([08-infrastructure.md](08-infrastructure.md) §6).
+- [ ] Post-deploy migrations → web/dashboard (the host's deploy check + live bundle) → mobile push only (no workflow) →
+      feature switches (infra apply) → post-release work.
 - [ ] DEPLOY-LOG, `DEPLOYED` marker, lock released, final report.
 
 ## I. Closing a session

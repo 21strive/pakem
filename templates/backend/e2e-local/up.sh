@@ -4,8 +4,8 @@
 # against the e2e database and e2e's own Redis. Logs and pids go to $E2E_RUN_DIR; down.sh stops them.
 #
 # The .env is GENERATED in $E2E_RUN_DIR (never .env.local/.env.staging, which point at remote hosts).
-# The contents of $E2E_RUN_DIR/env.extra (if present) are appended at the end — the place for e.g. TYPESENSE_* or
-# a payment gateway stand-in.
+# The contents of $E2E_RUN_DIR/env.extra (if present) are appended at the end — the place for e.g. the search engine's
+# env or a payment gateway stand-in.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 source scripts/e2e/local/env.sh
@@ -20,7 +20,7 @@ fi
 
 go build -o "$E2E_RUN_DIR/$E2E_APP" ./app/cmd
 [[ -n "$E2E_FAKE_OAUTH_PORT" ]] && (cd scripts/e2e && go build -o "$E2E_RUN_DIR/fakeoauth" ./fakeoauth)
-[[ -n "$E2E_FAKE_R2_PORT" ]] && (cd scripts/e2e && go build -o "$E2E_RUN_DIR/fakes3" ./fakes3)
+[[ -n "$E2E_FAKE_S3_PORT" ]] && (cd scripts/e2e && go build -o "$E2E_RUN_DIR/fakes3" ./fakes3)
 
 # Dummy password: an empty password makes libpq swallow the next DSN keyword (dbname); peer/trust auth
 # ignores it. Local Postgres runs without TLS. Pool sizes = production, so burst tests hit
@@ -48,14 +48,15 @@ EMAIL_SINK_DIR=$E2E_RUN_DIR/email
 WHATSAPP_ENABLED=false
 PUSH_ENABLED=false
 ENV
-if [[ -n "$E2E_FAKE_R2_PORT" ]]; then
-  fake="http://127.0.0.1:$E2E_FAKE_R2_PORT"
+# Object storage → the in-memory S3 stand-in. Rename the keys to the project's own config names.
+if [[ -n "$E2E_FAKE_S3_PORT" ]]; then
+  fake="http://127.0.0.1:$E2E_FAKE_S3_PORT"
   cat >> "$E2E_RUN_DIR/.env" <<ENV
-R2_ENDPOINT=$fake
-R2_BUCKET=${E2E_APP}-e2e
-R2_REGION=auto
-CLOUDFLARE_ACCESS_KEY_ID=fake-r2
-CLOUDFLARE_SECRET_ACCESS_KEY=fake-r2
+STORAGE_ENDPOINT=$fake
+STORAGE_BUCKET=${E2E_APP}-e2e
+STORAGE_REGION=local
+STORAGE_ACCESS_KEY_ID=fake-s3
+STORAGE_SECRET_ACCESS_KEY=fake-s3
 ASSET_PUBLIC_BASE_URL=$fake/${E2E_APP}-e2e
 ENV
 fi
@@ -69,7 +70,7 @@ start() { # name, args... (fakes run their own binary)
   echo $! > "$E2E_RUN_DIR/$name.pid"
 }
 [[ -n "$E2E_FAKE_OAUTH_PORT" ]] && start fakeoauth -addr "127.0.0.1:$E2E_FAKE_OAUTH_PORT"
-[[ -n "$E2E_FAKE_R2_PORT" ]] && start fakes3 -addr "127.0.0.1:$E2E_FAKE_R2_PORT"
+[[ -n "$E2E_FAKE_S3_PORT" ]] && start fakes3 -addr "127.0.0.1:$E2E_FAKE_S3_PORT"
 start server main
 start worker-notification worker notification
 for name in ${E2E_EXTRA_WORKERS:-}; do start "worker-$name" worker "$name"; done

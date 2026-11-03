@@ -1,4 +1,8 @@
 # Template — .github/workflows/terraform.yml in the <project>-prod-infra repo.
+# The infra repo's Terraform CI: plan on pull requests, apply on main, AWS credentials through GitHub OIDC.
+#
+# Case study "AWS + Supabase + Cloudflare" (pakem: case-studies/aws-supabase-cloudflare): an illustration, not part
+# of the pakem standard.
 name: Terraform
 
 on:

@@ -13,14 +13,34 @@ in §9 "Deviations from the blueprint".
 | Item | Value |
 |---|---|
 | Go module | `github.com/<org>/<app>` |
-| Binary / image | `<app>` / ECR `<project>-prod-app` |
-| AWS | dedicated project account, CLI profile `<profile>` (always `--profile <profile>`), region `<region>` |
-| ECS | cluster `<project>-prod-cluster`, services `<project>-prod-api` (main) and `<project>-prod-worker` (worker) |
-| Database | Supabase `<db>` through the pooler (application :6543 transaction, migrations/psql :5432 session); last migration in production: `NNN` |
-| Redis | Redis Cloud, single node, ≥ 6.2 |
-| Domain | `<domain>` (web), `api.<domain>`, `cdn.<domain>` (public R2), `internal.<domain>` (dashboard) |
-| Cloudflare | Pages `<project>-fe-main` / `-staging`, `internal-dashboard`; Worker `<project>-edge-main` / `-staging`; R2 `<public-bucket>`, `<private-bucket>` |
-| Logs | CloudWatch `/ecs/<project>-prod/api`, `/ecs/<project>-prod/worker` |
+| Binary / image | `<app>` / image repository `<project>-prod-app` |
+| Services | `<project>-prod-api` (main) and `<project>-prod-worker` (worker) |
+| Database | `<db>`; application through the pooler's transaction endpoint `<host:port>`, migrations/psql through the session endpoint `<host:port>`; last migration in production: `NNN` |
+| Domain | `<domain>` (web), `api.<domain>`, `cdn.<domain>` (public files), `internal.<domain>` (dashboard) |
+| Logs | `<log group/stream of the API>`, `<log group/stream of the worker>` |
+
+### 1.1 Providers (this project's choices)
+
+Pakem leaves products and services to the project ([`docs/blueprint/00-principles.md`](docs/blueprint/00-principles.md)
+§F 22). Record each choice next to the requirement it meets; change a row when the choice changes. A filled-in example is
+pakem's case study (`case-studies/aws-supabase-cloudflare`).
+
+| Role | Requirement (blueprint) | Product / service | Account, region, names |
+|---|---|---|---|
+| Cloud & container platform | one image as two services, rollout settings, circuit breaker (08 §4.2) | `<…>` | account `<…>`, CLI profile `<profile>` (always pass it), region `<region>` |
+| CPU architecture | the image is built for it, on a native runner (08 §5) | `<amd64 / arm64>` | |
+| Image registry | one repository, tags `latest` + `<short_sha>` (08 §6) | `<…>` | `<project>-prod-app` |
+| Load balancer & edge | TLS end to end, accepts only the edge (08 §4.3, 09 §1) | `<…>` | |
+| Postgres | managed or self-hosted, behind a transaction-mode pooler (02 §6) | `<…>` | `<db>`, endpoints above |
+| Redis | single node, ≥ 6.2 (04 §1) | `<…>` | |
+| Search engine | private, persistent data, one pinned version (05 §4) | `<…>` | version `<x.y>` |
+| Object storage | S3 API, public + private buckets (09 §4) | `<…>` | `<public-bucket>`, `<private-bucket>` |
+| Frontend hosting & edge function | Git-push deploys, functions only where needed (09 §2–§3) | `<…>` | `<site names>`, `<edge names>` |
+| DNS | proxied API record, email records (09 §1) | `<…>` | zone `<domain>` |
+| Email | a provider API, domain authenticated (05 §3.5) | `<…>` | sender `no-reply@<domain>` |
+| Logs & error tracker store | queryable log store; conditional writes (06) | `<…>` | |
+| Secret store | names in the infra repo, values injected at start (08 §3.2) | `<…>` | prefix `/<project>/prod` |
+| Infrastructure as code & CI | plan on PR, apply on `main`, federated credentials (08 §2) | `<…>` | |
 
 ## 2. Repo aliases
 
@@ -37,7 +57,7 @@ in §9 "Deviations from the blueprint".
 
 1. [`docs/blueprint/00-principles.md`](docs/blueprint/00-principles.md) — the core principles.
 2. The blueprint document for your task's topic (architecture 01, database 02, endpoints 03, caching 04, workers 05,
-   observability 06, testing 07, AWS 08, Cloudflare 09, workflow 10, checklists 11).
+   observability 06, testing 07, infrastructure 08, frontend & storage 09, workflow 10, checklists 11).
 3. This repo's `docs/reference/` — today's truth for the project's domain (including `docs/reference/platform/redifu.md`
    for the list of cached views).
 
@@ -73,12 +93,12 @@ CGO_ENABLED=0 GOOS=linux go build -o ./<app> ./app/cmd
 
 If the user says **deploy**, it means, per repo:
 
-- **BE:** merge into `master` (a direct merge commit, no PR unless asked), push `origin`, then
-  `gh workflow run deploy.yml --ref master` and monitor until the rollout is `COMPLETED` (blueprint 08 §6.2).
-- **FE / dashboard:** merge into the production branch, push `origin` — Cloudflare Pages deploys on its own.
-- **edge:** `npx wrangler deploy --env main --tag <sha>` from the branch that is in sync.
+- **BE:** merge into `master` (a direct merge commit, no PR unless asked), push `origin`, then `<deploy command>`
+  and monitor until both services are stable and run the new digest (blueprint 08 §6.2).
+- **FE / dashboard:** merge into the production branch, push `origin` — `<static host>` deploys on its own.
+- **edge:** `<edge deploy command, tagged with the SHA>` from the branch that is in sync.
 - **mobile:** merge into `develop`, push `origin`. **Never** trigger the app store release workflow.
-- **infra:** push to `main` = CI apply = service redeploy if the task definition changes.
+- **infra:** push to `main` = CI apply = service redeploy if a service definition changes.
 
 Cross-repo order: production migrations (with approval) → BE until finished → web/dashboard/mobile → feature switch.
 Take the deploy lock if there are several sessions (blueprint 10).
@@ -94,9 +114,10 @@ Take the deploy lock if there are several sessions (blueprint 10).
 
 ## 8. Local environment
 
-- DB & Redis always local; `JWT_API_SECRET` dummy; local Typesense through Docker per session, bound to `127.0.0.1`.
-- Production R2/Google/Zoom may be used only for entities/accounts created by the testing session.
-- Message & money sender credentials (payment gateway, WhatsApp, SES, FCM) are **not** copied to the local env.
+- DB & Redis always local; `JWT_API_SECRET` dummy; the search engine through Docker, one container per session, bound to
+  `127.0.0.1`.
+- Production object storage and OAuth providers may be used only for entities/accounts created by the testing session.
+- Message & money sender credentials (payment gateway, messaging, email, push) are **not** copied to the local env.
 - Production dump for local testing: `<path-dump>` (restore into a new local DB; contains PII — do not share it,
   empty the integration tokens before starting the server).
 - Every job that changes files: a worktree + new branch at `~/worktrees/<repo>/<branch-without-slash>` from

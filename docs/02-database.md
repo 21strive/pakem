@@ -1,13 +1,15 @@
 # 02 — Database: schema, migrations, backfills, connections
 
 PostgreSQL is the only source of truth. This document standardizes the shape of tables, how to change the schema safely in
-production without staging, and how the application connects to managed Postgres (Supabase) through the pooler.
+production without staging, and how the application connects to Postgres through a connection pooler. Where Postgres runs
+(a managed provider or self-hosted) is the project's decision; the
+[case study](../case-studies/aws-supabase-cloudflare/02-postgres-on-supabase.md) shows one managed setup.
 
 Markers: **MUST / MUST NOT / SHOULD**. **(improvement)** = a lesson from production incidents that is not common practice yet; required for new projects.
 
-Reference numbers for context: PostgreSQL 17.6 on Supabase Micro compute (`max_connections` 60, ±23
-backends when quiet); Supavisor pooler with Pool Size 15, Max Client Connections 200; production migrations take 0.1–0.4 s
-per file. The rules below are written for data that keeps growing.
+Reference numbers for context, from the case study: PostgreSQL 17.6 with `max_connections` 60 (±23 backends when quiet);
+a pooler with Pool Size 15 and Max Client Connections 200; production migrations take 0.1–0.4 s per file. The rules below
+are written for data that keeps growing.
 
 ---
 
@@ -398,7 +400,7 @@ if errorLog := ownerScopedWriteResult(result, err, constants.ERROR_BOOKING_NOT_F
 -- Deploy order: <BEFORE the code | RIGHT AFTER the deploy | any time> — <reason>
 -- Locks/rewrite: <metadata-only? ACCESS EXCLUSIVE for how long? CONCURRENTLY?>
 -- Before applying: <pre-check query: duplicates/overlaps that would make the constraint fail>
--- How to run: psql "<dsn :5432>" -X -v ON_ERROR_STOP=1 -f migrations/NNN_<what>.sql
+-- How to run: psql "<dsn: session endpoint>" -X -v ON_ERROR_STOP=1 -f migrations/NNN_<what>.sql
 -- Rollback: <how to go back; binary rollback limit: "do not roll back past <sha> without …">
 -- Backfill: <backfills/<x>.sql or command; before/after deploy>
 -- Additive only | DESTRUCTIVE (approved by <who> on <date>). Idempotent: every statement can run twice.
@@ -461,8 +463,8 @@ Production approval classes: [10-workflow.md](10-workflow.md) §6.3.
 ### 4.6 `CREATE INDEX CONCURRENTLY`
 
 ```sql
--- Run: psql "<dsn session :5432>" -X -v ON_ERROR_STOP=1 -f migrations/NNN_x.sql
---      plain psql: no BEGIN/COMMIT, no -1, never through the transaction pooler (:6543)
+-- Run: psql "<dsn: session endpoint>" -X -v ON_ERROR_STOP=1 -f migrations/NNN_x.sql
+--      plain psql: no BEGIN/COMMIT, no -1, never through the transaction pooler
 SET lock_timeout = 0;        -- a timeout that cuts the build leaves an INVALID index
 SET statement_timeout = 0;
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bookings_user_end_time ON bookings (user_uuid, end_time);
@@ -536,8 +538,8 @@ time):
    version as the server); tables that get rewritten are dumped separately; the psql log is kept.
 5. **Test first** on a production dump copy with all migrations since that dump, **twice** (idempotent); dry run
    `BEGIN; …; ROLLBACK;` or count the affected rows.
-6. **Run** through the **session pooler `:5432`** (never `:6543`), **one** short psql connection that is closed right
-   away, `-X -v ON_ERROR_STOP=1`, `lock_timeout 5s`, transaction mode as the header says.
+6. **Run** through the **session endpoint** (never the transaction pooler), **one** short psql connection that is
+   closed right away, `-X -v ON_ERROR_STOP=1`, `lock_timeout 5s`, transaction mode as the header says.
 7. **Read-only verification:** objects exist; old constraint gone/new one present; `indisvalid`; trigger count; rows that
    should not change did not change; application logs without `does not exist`; route probes.
 8. **Deploy** the code, then the "after deploy" migrations/backfills, then release the lock.
@@ -590,7 +592,7 @@ With a `schema_migrations` table (§2) this probe becomes a single `SELECT`.
 **While running**
 
 - [ ] Deploy lock; read-only probe; backup `pre<NNN>`.
-- [ ] `:5432`, one short psql, `ON_ERROR_STOP`, `lock_timeout`; record the duration.
+- [ ] Session endpoint, one short psql, `ON_ERROR_STOP`, `lock_timeout`; record the duration.
 - [ ] Read-only verification; application logs clean.
 - [ ] Deploy → "after" migrations/backfills → contract separately (approval if destructive).
 - [ ] Deploy log written; runbooks/docs updated.
@@ -639,27 +641,29 @@ Template: [`templates/docs/backfill.sql`](../templates/docs/backfill.sql).
 - Every process (API, worker, command) opens a **read** pool, a **write** pool, and a separate pool for a library that
   needs its own connections (ledger) — this breaks the cycle "hold one write connection, wait for a second connection
   from the same pool".
-- **Supabase through the pooler (Supavisor):**
-  - the direct-connection host only has an AAAA record; the ECS VPC is pure IPv4 →
-    `connect: cannot assign requested address`, API & worker crash-loop. **MUST**: the regional pooler host (A record)
-    and the username `postgres.<project-ref>`, changed together, **through Terraform**, not the console.
-  - **`:6543` (transaction mode) for the application**; **`:5432` (session mode) for manual work** (psql, migrations,
-    `pg_dump`, CONCURRENTLY).
-  - **Forbidden on the `:6543` path:** session-level `SET`, session advisory locks, `LISTEN/NOTIFY`, named `PREPARE`,
-    temporary tables, `WITH HOLD` cursors (transaction mode does not clean up state between clients).
+- **Through a pooler, two endpoints:**
+  - **the transaction-mode endpoint for the application** (API, worker, one-off commands), always with binary
+    parameters (§6.5);
+  - **a session-mode (or direct) endpoint for manual work** (psql, migrations, `pg_dump`, CONCURRENTLY, backfills).
+  - **Forbidden on the transaction-mode path:** session-level `SET`, session advisory locks, `LISTEN/NOTIFY`, named
+    `PREPARE`, temporary tables, `WITH HOLD` cursors (transaction mode does not clean up state between clients).
+- **MUST** check that the database host is reachable from the application's network **before the first deploy**: a host
+  that only has an AAAA record cannot be reached from an IPv4-only network (`connect: cannot assign requested address`,
+  API & worker crash-loop). Use an endpoint with an A record (often the pooler's). Host, port, and username change
+  **together, through the infrastructure code**, never in a console.
 
 ### 6.2 Env
 
 | Variable | Code default | Production (example) | Meaning |
 |---|---|---|---|
-| `POSTGRES_{WRITE,READ}_{HOST,PORT,USERNAME,PASSWORD,DBNAME}` | port 5432 | pooler host, port **6543**, user `postgres.<ref>` | read & write to the same endpoint (no replica yet) |
+| `POSTGRES_{WRITE,READ}_{HOST,PORT,USERNAME,PASSWORD,DBNAME}` | port 5432 | the pooler's **transaction-mode** endpoint | read & write to the same endpoint (no replica yet) |
 | `POSTGRES_WRITE_MAX_OPEN_CONNS` / `POSTGRES_READ_MAX_OPEN_CONNS` | 100 / 100 | **10 / 10** | pool size including idle (MaxIdle = MaxOpen) |
 | `LEDGER_DB_MAX_OPEN_CONNS` | 5 | **2** | library pool |
-| `POSTGRES_BINARY_PARAMETERS` | false | **"true"** | required on `:6543` (§6.5) |
+| `POSTGRES_BINARY_PARAMETERS` | false | **"true"** | required on a transaction-mode endpoint (§6.5) |
 | `POSTGRES_SSLMODE` / `POSTGRES_SSLROOTCERT` | empty → `require` (`verify-full` when a CA is set) | `"require"` | a value outside lib/pq's 6 modes stops the process at start |
 | `POSTGRES_TX_LOCK_TIMEOUT` / `_STATEMENT_TIMEOUT` / `_IDLE_TIMEOUT` | 5s / 30s / 60s | default | `SET LOCAL` per transaction |
 | `LEDGER_CALL_TIMEOUT` | 40s | default | deadline for payment library calls from the request path |
-| `HTTP_READ/WRITE/IDLE_TIMEOUT` | 30s / 30s / 120s | default | idle **must be > the ALB idle timeout (60 s)**, otherwise the ALB uses a connection that was just closed → 502 |
+| `HTTP_READ/WRITE/IDLE_TIMEOUT` | 30s / 30s / 120s | default | idle **must be > the load balancer's idle timeout** (e.g. 60 s), otherwise the load balancer uses a connection that was just closed → 502 |
 
 ### 6.3 Pool settings in code
 
@@ -669,7 +673,7 @@ db.SetMaxIdleConns(maxOpenConns)         // idle up to the pool size: close-and-
 db.SetMaxOpenConns(maxOpenConns)         // requests wait in the process instead of opening connections the pooler rejects
 db.SetConnMaxLifetime(3 * time.Minute)   // pooler node rotation
 db.SetConnMaxIdleTime(time.Minute)       // idle connections give their slot back
-// start: 10 attempts × 5 s (still within the ALB health check grace period), then panic
+// start: 10 attempts × 5 s (still within the load balancer's health check grace period), then panic
 ```
 
 - Incident: `SetConnMaxLifetime(time.Duration(10))` = **10 nanoseconds** → a new handshake on every checkout. Durations
@@ -678,23 +682,25 @@ db.SetConnMaxIdleTime(time.Minute)       // idle connections give their slot bac
   up on the first attempt → retry 10 × 5 s.
 - Start log: `postgres <host>: connected (sslmode=<mode>)`. The DSN **MUST NOT** ever be logged.
 - **`/health`:** take one write connection within 2 s, then return it; **503 only when the pool is exhausted and a ping
-  through the read pool succeeds within 1 s** (the ALB stops sending traffic, ECS replaces the stuck task); other DB
-  errors stay 200 and are only logged (a momentary DB disruption does not make ECS replace every task at once).
+  through the read pool succeeds within 1 s** (the load balancer stops sending traffic, the platform replaces the stuck
+  instance); other DB errors stay 200 and are only logged (a momentary DB disruption does not make the platform replace
+  every instance at once).
 
 ### 6.4 Pool size: the formula
 
 - N = the largest number of concurrent processes = 2 × `api_max_capacity` (200% deploy) + worker (+ command task) —
   e.g. 2 × 4 + 1 = **9**. C = write + read + library per process.
-- **Transaction mode:** requires **N × C ≤ M** (Max Client Connections per Supavisor pool; idle connections count). M = 200
-  → C ≤ 22 → **10 + 10 + 2** (9 × 22 = 198). The (M+1)th client is rejected with `EMAXCONN`. A command task adds one
-  process → small pools.
-- **Session mode:** every client connection pins one server slot: N × C ≤ Pool Size (15) — **does not fit** more than one
-  API task (incident October 13–18: 244× `EMAXCONNSESSION`, 500s during page-load bursts).
-- **Server limit:** 2 × (Pool Size + 1) + other connections ≤ `max_connections` (60) → Pool Size stays at 15.
-- Queueing in the pooler shows up as **latency**, not errors; beyond `pool_checkout_timeout` the pooler drops the client
+- **Transaction mode:** requires **N × C ≤ M** (the pooler's limit on client connections per pool; idle connections
+  count). With M = 200 → C ≤ 22 → **10 + 10 + 2** (9 × 22 = 198). The (M+1)th client is rejected. A command task adds
+  one process → small pools.
+- **Session mode:** every client connection pins one server slot: N × C ≤ the pool size (15 in the case study) — **does
+  not fit** more than one API instance (incident October 13–18: 244× `EMAXCONNSESSION`, 500s during page-load bursts).
+- **Server limit:** 2 × (pool size + 1) + other connections ≤ `max_connections` (60 in the case study) → the pool size
+  stays at 15.
+- Queueing in the pooler shows up as **latency**, not errors; beyond its checkout timeout the pooler drops the client
   (`driver: bad connection`).
-- The numbers **MUST** be recomputed whenever M, compute, or the autoscaling limits change; the formula and its values are
-  commented in tfvars.
+- The numbers **MUST** be recomputed whenever M, the database size, or the autoscaling limits change; the formula and its
+  values are written as comments next to the pool settings in the committed infra settings.
 
 ### 6.5 `binary_parameters` (a transaction-mode requirement)
 
@@ -707,20 +713,21 @@ db.SetConnMaxIdleTime(time.Minute)       // idle connections give their slot bac
   `app/database` wraps the lib/pq connection and turns every `[]byte` argument into a `string` (`[]byte(nil)` stays NULL)
   — which also protects libraries. Consequence: **no `bytea` columns**.
 - **Write exactly `"true"`** (an unrecognized value is read as `false` without an error).
-- **Other programs' clients on `:6543` must also send each query in a single round trip** (lib/pq + binary, or the simple
-  query protocol).
-- **Manual work through `:6543` poisons the application's pool connections** (local test: a
+- **Other programs' clients on the transaction-mode endpoint must also send each query in a single round trip** (lib/pq
+  + binary, or the simple query protocol).
+- **Manual work through the transaction-mode endpoint poisons the application's pool connections** (local test: a
   `set_config('search_path', '', false)` from a dump landed on a pooled server connection → 28/400 application queries
-  failed). Recovery: terminate that user's pooler server connections through `:5432`:
+  failed). Recovery: terminate that user's pooler server connections through the session endpoint:
   ```sql
   SELECT pg_terminate_backend(pid) FROM pg_stat_activity
   WHERE usename = current_user AND datname = current_database()
     AND backend_type = 'client backend' AND pid <> pg_backend_pid();
   ```
-- **Proven release order:** phase 1 `POSTGRES_BINARY_PARAMETERS=true` on `:5432` only (the driver change kept separate
-  from the pooler change) → phase 2 port 6543 **together** with the new pools → watch for 0 `EMAXCONN`, 0 driver errors,
-  0 5xx. Rollback: port back to 5432. **MUST NOT** ever use `:6543` without binary parameters. Validation without staging:
-  a local Supavisor with exactly the production env + an e2e burst test.
+- **Proven release order:** phase 1 `POSTGRES_BINARY_PARAMETERS=true` on the session endpoint only (the driver change
+  kept separate from the pooler change) → phase 2 the transaction-mode endpoint **together** with the new pools → watch
+  for 0 "too many clients" rejections, 0 driver errors, 0 5xx. Rollback: back to the session endpoint. **MUST NOT** ever
+  use the transaction-mode endpoint without binary parameters. Validation without staging: a local pooler of the same
+  kind as production, with exactly the production env + an e2e burst test.
 
 ### 6.6 Timeouts
 
@@ -735,7 +742,7 @@ db.SetConnMaxIdleTime(time.Minute)       // idle connections give their slot bac
 
 - **MUST**: TLS to the pooler; the code default is `require` (encrypted, ≥ TLS 1.2, certificate not checked). `disable`
   only for a local Postgres without TLS.
-- `verify-full`: the Supabase CA is not in the system trust store → ship the CA file in the image (it is public),
+- `verify-full`: when the provider's CA is not in the system trust store, ship the CA file in the image (it is public),
   `POSTGRES_SSLROOTCERT=<path>` → the mode switches to `verify-full` automatically.
 
 ### 6.8 Env & DSN pitfalls
@@ -754,7 +761,7 @@ db.SetConnMaxIdleTime(time.Minute)       // idle connections give their slot bac
 
 | Log pattern | Meaning |
 |---|---|
-| `EMAXCONN` | `EMAXCONNSESSION`: the 16th client in session mode; `EMAXCONN … limit: M`: N × C > M |
+| the pooler's "too many clients" error (Supavisor: `EMAXCONN`/`EMAXCONNSESSION`; PgBouncer: `no more connections allowed`) | more clients than the pool allows: N × C > M (transaction mode) or > the pool size (session mode) |
 | `prepared statement`, `bind message`, `unsupported jsonb version number`, `incorrect binary data format` | protocol split/binary issue; must be 0 |
 | `driver: bad connection` | the pooler dropped the client (checkout timeout) |
 | `error_kind=unavailable` + lock name | lock queueing (lock_timeout) |
@@ -773,11 +780,11 @@ db.SetConnMaxIdleTime(time.Minute)       // idle connections give their slot bac
 | `DEFAULT USER` = CURRENT_USER | defaults always quoted |
 | double booking, duplicate ledger accounts | per-owner lock + constraint |
 | `ConnMaxLifetime(10)` = 10 ns | durations with units |
-| IPv6-only direct host in an IPv4 VPC → crash-loop | pooler host + username with the ref, env through Terraform |
+| IPv6-only DB host from an IPv4-only network → crash-loop | an endpoint with an A record; host + username changed together, through the infrastructure code |
 | deploy failed with `EMAXCONNSESSION` at start | connection retry 10 × 5 s |
 | 244× `EMAXCONNSESSION` (500s during bursts) | pools from env, transaction mode + binary params |
-| migration psql rejected with `EMAXCONNSESSION` | one short psql; the application on 6543 |
-| psql through 6543 poisons `search_path` | manual work only through 5432 |
+| migration psql rejected with `EMAXCONNSESSION` | one short psql; the application on the transaction-mode endpoint |
+| psql through the transaction-mode endpoint poisons `search_path` | manual work only through the session endpoint |
 | indexer discards unknown types | workers never mark what they do not recognize; backfill after the worker is live |
 | float noise in webhook amounts | parse to the nearest smallest unit, reject real decimals |
 
@@ -787,7 +794,7 @@ db.SetConnMaxIdleTime(time.Minute)       // idle connections give their slot bac
 
 ### 7.1 Production dumps
 
-- **Read-only:** against production only `pg_dump` and verification `SELECT`s, through the **session pooler `:5432`**.
+- **Read-only:** against production only `pg_dump` and verification `SELECT`s, through the **session endpoint**.
 - **MUST**: `pg_dump` with the same major version as the server.
 - `pg_dump -Fc -v -f <name>.dump`; verify with `pg_restore --list`; a manifest with the sha256 and the row count per
   table; `chmod 600`.
